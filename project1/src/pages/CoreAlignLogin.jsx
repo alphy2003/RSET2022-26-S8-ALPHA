@@ -5,7 +5,6 @@ import LoginCard from '../components/LoginCard';
 import LoginHeader from '../components/LoginHeader';
 import LoginInput from '../components/LoginInput';
 import PasswordInput from '../components/PasswordInput';
-import FormOptions from '../components/FormOptions';
 import LoginButton from '../components/LoginButton';
 import SignupLink from '../components/SignupLink';
 import { useFirebase } from '../context/firebase';
@@ -14,7 +13,6 @@ function CoreAlignLogin() {
   const firebase = useFirebase();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [rememberMe, setRememberMe] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
@@ -39,10 +37,6 @@ function CoreAlignLogin() {
         setError('Failed to sign in. Please try again.');
       }
     }
-  };
-
-  const handleForgotPassword = () => {
-    alert('Forgot password clicked');
   };
 
   const handleSignup = () => {
@@ -84,12 +78,6 @@ function CoreAlignLogin() {
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           required
-        />
-
-        <FormOptions
-          rememberMe={rememberMe}
-          onRememberMeChange={setRememberMe}
-          onForgotPassword={handleForgotPassword}
         />
 
         <LoginButton type="submit" disabled={loading}>

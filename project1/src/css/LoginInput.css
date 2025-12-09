@@ -1,20 +1,20 @@
 /* LoginInput.css - Styles for the input component */
 
 .form-field {
-  margin-bottom: 20px;
+  margin-bottom: 14px;
 }
 
 .form-label {
   color: #ffffff;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
   display: block;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
 }
 
 .form-input {
   width: 100%;
-  padding: 12px 16px;
+  padding: 10px 14px;
   background-color: #2a2a2a;
   border: none;
   border-radius: 8px;

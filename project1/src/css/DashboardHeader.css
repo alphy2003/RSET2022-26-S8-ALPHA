@@ -4,9 +4,7 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 30px;
   padding-bottom: 20px;
-  border-bottom: 1px solid #333333;
 }
 
 .header-user {
@@ -55,8 +53,8 @@
 }
 
 .logout-button:hover {
-  background-color: #ffffff;
-  color: #000000;
+  background-color: #141414;
+  color: #ffffff;
 }
 
 @media (max-width: 768px) {

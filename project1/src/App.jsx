@@ -5,6 +5,7 @@ import { useFirebase } from './context/firebase'
 import CoreAlignLogin from './pages/CoreAlignLogin';
 import UserDashboard from './pages/UserDashboard';
 import SignupPage from './pages/SignupPage';
+import Workout from './pages/Workout';
 import ProtectedRoute from './components/ProtectedRoute';
 
 function App() {
@@ -41,12 +42,20 @@ function App() {
           element={currentUser ? <Navigate to="/dashboard" replace /> : <SignupPage />} 
         />
         
-        {/* Protected route */}
+        {/* Protected routes */}
         <Route 
           path="/dashboard" 
           element={
             <ProtectedRoute>
               <UserDashboard />
+            </ProtectedRoute>
+          } 
+        />
+        <Route 
+          path="/workout" 
+          element={
+            <ProtectedRoute>
+              <Workout />
             </ProtectedRoute>
           } 
         />

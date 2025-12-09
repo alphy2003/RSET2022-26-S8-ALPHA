@@ -1,0 +1,29 @@
+/* Workout.css - Main container layout */
+
+.workout-container {
+  display: flex;
+  gap: 15px;
+  padding: 5px;
+  background: #000;
+  min-height: 100vh;
+  width: 100%;
+  overflow-y: auto;
+  position: relative;
+  box-sizing: border-box;
+}
+
+/* Trainer Video Section (Left Side) */
+.workout-container > div:first-child {
+  flex: 0 0 72%;
+  max-width: 72%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* User Webcam Section (Right Side) */
+.workout-container > div:nth-child(2) {
+  flex: 0 0 26%;
+  max-width: 26%;
+  display: flex;
+  flex-direction: column;
+}

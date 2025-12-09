@@ -7,7 +7,6 @@ import SignupHeader from '../components/SignupHeader';
 import LoginInput from '../components/LoginInput';
 import PasswordInput from '../components/PasswordInput';
 import SignupButton from '../components/SignupButton';
-import GoogleSignupButton from '../components/GoogleSignupButton';
 import SigninLink from '../components/SigninLink';
 import '../css/SignupPage.css';
 
@@ -48,11 +47,6 @@ function SignupPage() {
         setError('Failed to create account. Please try again.');
       }
     }
-  };
-
-  const handleGoogleSignup = () => {
-    alert('Google signup clicked');
-    // Add your Google OAuth logic here
   };
 
   const handleSignin = () => {
@@ -119,14 +113,6 @@ function SignupPage() {
           {loading ? 'Creating Account...' : 'Create Account'}
         </SignupButton>
       </form>
-
-      <div className="signup-divider">
-        <span className="divider-line"></span>
-        <span className="divider-text">OR SIGN UP WITH</span>
-        <span className="divider-line"></span>
-      </div>
-
-      <GoogleSignupButton onClick={handleGoogleSignup} />
 
       <SigninLink onSigninClick={handleSignin} />
     </LoginCard>

@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "firebase/auth";
-import { getFirestore, doc, setDoc, getDoc } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: "AIzaSyASECyssLCgDp96CyU2wIl3OEz7LdibX-Q",
@@ -80,8 +80,54 @@ export const FirebaseProvider = (props) => {
         }
     };
 
+    const getRecentSessions = async (userId, limitCount = null) => {
+        try {
+            const sessionsRef = collection(firestore, "users", userId, "sessions");
+            let sessionsQuery;
+            
+            if (limitCount) {
+                sessionsQuery = query(sessionsRef, orderBy("date", "desc"), limit(limitCount));
+            } else {
+                sessionsQuery = query(sessionsRef, orderBy("date", "desc"));
+            }
+            
+            const querySnapshot = await getDocs(sessionsQuery);
+            
+            const sessions = querySnapshot.docs.map(doc => {
+                const data = doc.data();
+                
+                // Format date from Firestore Timestamp to "Friday, June 17, 2022"
+                let formattedDate = '';
+                if (data.date && data.date.toDate) {
+                    const dateObj = data.date.toDate();
+                    formattedDate = dateObj.toLocaleDateString('en-US', {
+                        weekday: 'long',
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric'
+                    });
+                }
+                
+                // Convert durationSeconds to minutes with "m" suffix
+                const durationMinutes = Math.round((data.durationSeconds || 0) / 60);
+                const formattedDuration = `${durationMinutes}m`;
+                
+                return {
+                    name: data.sessionName || '',
+                    date: formattedDate,
+                    duration: formattedDuration
+                };
+            });
+            
+            return sessions;
+        } catch (error) {
+            console.error("Error fetching recent sessions:", error);
+            return [];
+        }
+    };
+
     return(
-        <FirebaseContext.Provider value={{ signup, signin, signout, currentUser, loading, getUserData }}>
+        <FirebaseContext.Provider value={{ signup, signin, signout, currentUser, loading, getUserData, getRecentSessions }}>
             {props.children}
         </FirebaseContext.Provider>
     );

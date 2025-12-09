@@ -4,7 +4,7 @@ import '../css/RecentSessionsCard.css';
 import recentSessionsIcon from '../assets/recentsessions.svg';
 import sessionDumbellIcon from '../assets/recentsessiondumbell.svg';
 
-function RecentSessionsCard({ sessions, onViewDetails }) {
+function RecentSessionsCard({ sessions, onViewDetails, showViewAll, isViewingAll, onToggleViewAll }) {
   return (
     <div className="recent-sessions-card">
       <div className="card-header">
@@ -12,20 +12,26 @@ function RecentSessionsCard({ sessions, onViewDetails }) {
           <img src={recentSessionsIcon} alt="Recent Sessions" />
         </span>
         <h3 className="card-title">Recent Sessions</h3>
+        {showViewAll && (
+          <button 
+            className="view-all-btn"
+            onClick={onToggleViewAll}
+          >
+            {isViewingAll ? 'Show Less' : 'View All'}
+          </button>
+        )}
       </div>
-      <p style={{ margin: '5px 0 0 0', fontSize: '13px', color: '#808080' }}>
-        Your latest workout sessions and performance
-      </p>
       
-      <div className="sessions-list">
+      
+      <div className={`sessions-list ${isViewingAll ? 'expanded' : ''}`}>
         {sessions.map((session, index) => (
           <div key={index} className="session-item">
             <div className="session-left">
               <div className="session-icon">
-                <img src={sessionDumbellIcon} alt={session.type} />
+                <img src={sessionDumbellIcon} alt={session.name} />
               </div>
               <div className="session-info">
-                <h4>{session.type}</h4>
+                <h4>{session.name}</h4>
                 <p>{session.date}</p>
               </div>
             </div>

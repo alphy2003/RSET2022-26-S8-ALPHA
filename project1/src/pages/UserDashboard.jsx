@@ -19,6 +19,9 @@ function UserDashboard() {
   const [userData, setUserData] = useState(null);
   const [dataLoading, setDataLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [recentSessions, setRecentSessions] = useState([]);
+  const [allSessions, setAllSessions] = useState([]);
+  const [showAllSessions, setShowAllSessions] = useState(false);
 
   // Fetch user data from Firestore
   useEffect(() => {
@@ -32,6 +35,15 @@ function UserDashboard() {
         setDataLoading(true);
         const data = await firebase.getUserData(firebase.currentUser.uid);
         setUserData(data);
+        
+        // Fetch recent sessions (limited to 4)
+        const sessions = await firebase.getRecentSessions(firebase.currentUser.uid, 4);
+        setRecentSessions(sessions);
+        
+        // Fetch all sessions to check if there are more than 4
+        const allSessionsData = await firebase.getRecentSessions(firebase.currentUser.uid);
+        setAllSessions(allSessionsData);
+        
         setError(null);
       } catch (err) {
         setError(err.message);
@@ -54,33 +66,8 @@ function UserDashboard() {
     }
   };
 
-  // Sample data for recent sessions (keeping for now)
-  const recentSessions = [
-    {
-      type: 'Cardio',
-      date: 'Tue, Jun 28',
-      duration: '35m'
-    },
-    {
-      type: 'Cardio',
-      date: 'Sun, Jun 26',
-      duration: '35m'
-    },
-    {
-      type: 'Lower Body',
-      date: 'Fri, Jun 24',
-      duration: '50m'
-    },
-    {
-      type: 'Full Body',
-      date: 'Wed, Jun 22',
-      duration: '60m'
-    }
-  ];
-
   const handleStartWorkout = () => {
-    alert('Starting workout session!');
-    // Add your start workout logic here
+    navigate('/workout');
   };
 
   const handleViewDetails = (session) => {
@@ -133,11 +120,9 @@ function UserDashboard() {
           username={userData.name}
         />
 
-        {/* Workout Card */}
-        <WorkoutCard onStartWorkout={handleStartWorkout} />
-
-        {/* Stats Grid */}
-        <div className="stats-grid">
+        {/* Top Cards Row - Workout, Weekly Goal, Quick Stats */}
+        <div className="top-cards-row">
+          <WorkoutCard onStartWorkout={handleStartWorkout} />
           <WeeklyGoalCard 
             current={0}
             target={userData.weeklyWorkoutsTarget} 
@@ -151,8 +136,11 @@ function UserDashboard() {
 
         {/* Recent Sessions */}
         <RecentSessionsCard 
-          sessions={recentSessions}
+          sessions={showAllSessions ? allSessions : recentSessions}
           onViewDetails={handleViewDetails}
+          showViewAll={allSessions.length > 4}
+          isViewingAll={showAllSessions}
+          onToggleViewAll={() => setShowAllSessions(!showAllSessions)}
         />
       </div>
     </div>
