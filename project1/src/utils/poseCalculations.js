@@ -18,10 +18,7 @@ export const calculateAngle = (a, b, c) => {
     angle = 360 - angle;
   }
   
-  return {
-    angle: parseFloat(angle.toFixed(2)),
-    confidence: parseFloat((angleConfidence * 100).toFixed(1))
-  };
+  return [Math.round(angle), Math.round(angleConfidence * 100)];
 };
 
 // Calculate all joint angles
@@ -29,37 +26,46 @@ export const calculateJointAngles = (landmarks) => {
   if (!landmarks || landmarks.length < 33) return {};
 
   return {
-    leftShoulder: calculateAngle(landmarks[23], landmarks[11], landmarks[13]),
-    leftElbow: calculateAngle(landmarks[11], landmarks[13], landmarks[15]),
-    leftWrist: calculateAngle(landmarks[13], landmarks[15], landmarks[19]),
-    rightShoulder: calculateAngle(landmarks[24], landmarks[12], landmarks[14]),
-    rightElbow: calculateAngle(landmarks[12], landmarks[14], landmarks[16]),
-    rightWrist: calculateAngle(landmarks[14], landmarks[16], landmarks[20]),
-    leftHip: calculateAngle(landmarks[11], landmarks[23], landmarks[25]),
-    leftKnee: calculateAngle(landmarks[23], landmarks[25], landmarks[27]),
-    leftAnkle: calculateAngle(landmarks[25], landmarks[27], landmarks[31]),
-    rightHip: calculateAngle(landmarks[12], landmarks[24], landmarks[26]),
-    rightKnee: calculateAngle(landmarks[24], landmarks[26], landmarks[28]),
-    rightAnkle: calculateAngle(landmarks[26], landmarks[28], landmarks[32]),
-    leftSpine: calculateAngle(landmarks[11], landmarks[23], landmarks[25]),
-    rightSpine: calculateAngle(landmarks[12], landmarks[24], landmarks[26]),
-    neck: calculateAngle(landmarks[11], landmarks[0], landmarks[12])
+    ls: calculateAngle(landmarks[23], landmarks[11], landmarks[13]),
+    le: calculateAngle(landmarks[11], landmarks[13], landmarks[15]),
+    lw: calculateAngle(landmarks[13], landmarks[15], landmarks[19]),
+    rs: calculateAngle(landmarks[24], landmarks[12], landmarks[14]),
+    re: calculateAngle(landmarks[12], landmarks[14], landmarks[16]),
+    rw: calculateAngle(landmarks[14], landmarks[16], landmarks[20]),
+    lh: calculateAngle(landmarks[11], landmarks[23], landmarks[25]),
+    lk: calculateAngle(landmarks[23], landmarks[25], landmarks[27]),
+    la: calculateAngle(landmarks[25], landmarks[27], landmarks[31]),
+    rh: calculateAngle(landmarks[12], landmarks[24], landmarks[26]),
+    rk: calculateAngle(landmarks[24], landmarks[26], landmarks[28]),
+    ra: calculateAngle(landmarks[26], landmarks[28], landmarks[32]),
+    lsp: calculateAngle(landmarks[11], landmarks[23], landmarks[25]),
+    rsp: calculateAngle(landmarks[12], landmarks[24], landmarks[26]),
+    n: calculateAngle(landmarks[11], landmarks[0], landmarks[12])
   };
 };
 
 // Create combined workout data snapshot
 export const createWorkoutDataSnapshot = (trainerAngles, userAngles, gesture, gestureConfidence, timestamp) => {
-  return {
-    timestamp: timestamp || Date.now(),
-    trainer: {
-      pose: trainerAngles
-    },
-    user: {
-      pose: userAngles,
-      gesture: {
-        name: gesture || null,
-        confidence: gestureConfidence ? parseFloat((gestureConfidence * 100).toFixed(1)) : 0
-      }
-    }
+  const data = {
+    t: timestamp || Date.now()
   };
+
+  // Add trainer angles with tr_ prefix
+  if (trainerAngles && Object.keys(trainerAngles).length > 0) {
+    Object.entries(trainerAngles).forEach(([key, value]) => {
+      data[`tr_${key}`] = value;
+    });
+  }
+
+  // Add user angles with u_ prefix
+  if (userAngles && Object.keys(userAngles).length > 0) {
+    Object.entries(userAngles).forEach(([key, value]) => {
+      data[`u_${key}`] = value;
+    });
+  }
+
+  // Add gesture (just the name, no confidence)
+  data.gest = gesture || null;
+
+  return data;
 };
