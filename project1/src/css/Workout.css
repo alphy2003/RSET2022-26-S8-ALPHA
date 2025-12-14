@@ -20,10 +20,11 @@
   flex-direction: column;
 }
 
-/* User Webcam Section (Right Side) */
-.workout-container > div:nth-child(2) {
+/* Right Column - Contains Webcam and DataSender stacked vertically */
+.right-column {
   flex: 0 0 26%;
   max-width: 26%;
   display: flex;
   flex-direction: column;
+  gap: 15px;
 }

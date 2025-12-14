@@ -24,6 +24,11 @@ const VideoUploadPose = forwardRef(({ videoFile, onVideoFileChange, onPlayStateC
   const showOverlayRef = useRef(true);
   const frameCountRef = useRef(0);
   const fpsUpdateTimeRef = useRef(Date.now());
+  
+  // Web Worker for angle calculations
+  const angleWorkerRef = useRef(null);
+  const useWorkerRef = useRef(true);
+  
 
   // Expose video ref to parent
   useImperativeHandle(ref, () => ({
@@ -42,12 +47,19 @@ const VideoUploadPose = forwardRef(({ videoFile, onVideoFileChange, onPlayStateC
     canvasCtx.clearRect(0, 0, uploadCanvasRef.current.width, uploadCanvasRef.current.height);
 
     if (results.poseLandmarks) {
-      const jointAngles = calculateJointAngles(results.poseLandmarks);
-      setAngles(jointAngles);
-      
-      // Send angles to parent component
-      if (onAnglesUpdate) {
-        onAnglesUpdate(jointAngles);
+      // Use worker if available, otherwise fallback to main thread
+      if (useWorkerRef.current && angleWorkerRef.current) {
+        // Post landmarks to worker for angle calculation
+        angleWorkerRef.current.postMessage({ landmarks: results.poseLandmarks });
+      } else {
+        // Fallback: Calculate on main thread
+        const jointAngles = calculateJointAngles(results.poseLandmarks);
+        setAngles(jointAngles);
+        
+        // Send angles to parent component
+        if (onAnglesUpdate) {
+          onAnglesUpdate(jointAngles);
+        }
       }
 
       if (showOverlayRef.current) {
@@ -165,6 +177,64 @@ const VideoUploadPose = forwardRef(({ videoFile, onVideoFileChange, onPlayStateC
       }
       if (uploadPoseRef.current) {
         uploadPoseRef.current.close();
+      }
+    };
+  }, []);
+
+  const useLatest = (value) => {
+    const ref = useRef(value);
+    useEffect(() => {
+      ref.current = value;
+    }, [value]);
+    return ref;
+  };
+
+  const onAnglesUpdateRef = useLatest(onAnglesUpdate);
+
+  // Initialize Web Worker for angle calculations
+  useEffect(() => {
+    try {
+      // Initialize worker
+      const worker = new Worker(
+        new URL('../workers/angleCalculationsWorker.js', import.meta.url),
+        { type: 'module' }
+      );
+      
+      // Handle messages from worker
+      worker.onmessage = (e) => {
+        const { success, angles, error } = e.data;
+        
+        if (success && angles) {
+          setAngles(angles);
+          // Use the latest onAnglesUpdate from ref
+          if (onAnglesUpdateRef.current) {
+            onAnglesUpdateRef.current(angles);
+          }
+        } else if (error) {
+          console.error('Worker calculation error:', error);
+          useWorkerRef.current = false; // Switch to fallback
+        }
+      };
+      
+      // Handle worker errors
+      worker.onerror = (error) => {
+        console.warn('Worker error, switching to main thread calculations:', error.message);
+        useWorkerRef.current = false;
+      };
+      
+      angleWorkerRef.current = worker;
+      console.log('✅ Angle calculation worker initialized');
+      
+    } catch (error) {
+      console.warn('Failed to initialize worker, using main thread:', error.message);
+      useWorkerRef.current = false;
+    }
+    
+    // Cleanup worker on unmount
+    return () => {
+      if (angleWorkerRef.current) {
+        angleWorkerRef.current.terminate();
+        console.log('🛑 Angle calculation worker terminated');
       }
     };
   }, []);

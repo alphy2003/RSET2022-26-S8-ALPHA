@@ -1,6 +1,7 @@
 import './App.css'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useFirebase } from './context/firebase'
+import { WebSocketProvider } from './context/WebSocketContext'
 
 import CoreAlignLogin from './pages/CoreAlignLogin';
 import UserDashboard from './pages/UserDashboard';
@@ -27,10 +28,11 @@ function App() {
   }
 
   return (
-    <div className="App">
-      <Routes>
-        {/* Default route */}
-        <Route path="/" element={<Navigate to={currentUser ? "/dashboard" : "/login"} replace />} />
+    <WebSocketProvider>
+      <div className="App">
+        <Routes>
+          {/* Default route */}
+          <Route path="/" element={<Navigate to={currentUser ? "/dashboard" : "/login"} replace />} />
         
         {/* Public routes - redirect to dashboard if already logged in */}
         <Route 
@@ -63,7 +65,8 @@ function App() {
         {/* Catch all */}
         <Route path="*" element={<Navigate to={currentUser ? "/dashboard" : "/login"} replace />} />
       </Routes>
-    </div>
+      </div>
+    </WebSocketProvider>
   )
   
 }

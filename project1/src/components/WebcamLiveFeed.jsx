@@ -10,7 +10,7 @@ import cameraIcon from '../assets/cameraicon.svg';
 import overlayIcon from '../assets/overlay.svg';
 import '../css/WebcamLiveFeed.css';
 
-function WebcamLiveFeed({ onGestureDetected, onAnglesUpdate, onGestureUpdate }) {
+function WebcamLiveFeed({ onGestureDetected, onAnglesUpdate, onGestureUpdate, onCameraStateChange }) {
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [showWebcamOverlay, setShowWebcamOverlay] = useState(true);
   const [webcamAngles, setWebcamAngles] = useState({});
@@ -144,6 +144,7 @@ function WebcamLiveFeed({ onGestureDetected, onAnglesUpdate, onGestureUpdate }) 
         webcamStreamRef.current = stream;
         setIsCameraOn(true);
         isCameraOnRef.current = true;
+        if (onCameraStateChange) onCameraStateChange(true);
         
         webcamVideoRef.current.onloadedmetadata = () => {
           if (webcamPoseRef.current && poseModelLoaded) {
@@ -180,6 +181,7 @@ function WebcamLiveFeed({ onGestureDetected, onAnglesUpdate, onGestureUpdate }) 
     
     setIsCameraOn(false);
     isCameraOnRef.current = false;
+    if (onCameraStateChange) onCameraStateChange(false);
     setWebcamAngles({});
     setCurrentGesture(null);
     setGestureConfidence(0);
