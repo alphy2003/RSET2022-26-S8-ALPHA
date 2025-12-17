@@ -5,12 +5,8 @@ export const calculateAngle = (a, b, c) => {
   const bVis = b.visibility ?? 1.0;
   const cVis = c.visibility ?? 1.0;
   
-  // Weighted confidence: middle point (joint) is most important
-  const angleConfidence = (
-    aVis * 0.25 +
-    bVis * 0.50 +  // Joint itself gets 50% weight
-    cVis * 0.25
-  );
+  // Confidence: use minimum value among the 3 points
+  const angleConfidence = Math.min(aVis, bVis, cVis);
   
   const radians = Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(a.y - b.y, a.x - b.x);
   let angle = Math.abs((radians * 180.0) / Math.PI);
