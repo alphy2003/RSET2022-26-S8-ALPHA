@@ -56,9 +56,9 @@ function App() {
         <Route 
           path="/workout" 
           element={
-            <ProtectedRoute>
+            
               <Workout />
-            </ProtectedRoute>
+            
           } 
         />
         

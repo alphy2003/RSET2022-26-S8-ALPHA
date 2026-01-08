@@ -1,129 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
-import json
-
-app = FastAPI()
-
-# Enable CORS for frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite default port
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Store all connected WebSocket clients
-active_connections: list[WebSocket] = []
-
-@app.get("/")
-def read_root():
-    return {"hello"}
-
-@app.get("/messages", response_class=HTMLResponse)
-async def get_messages_page():
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Messages Display</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                max-width: 800px;
-                margin: 50px auto;
-                padding: 20px;
-                background-color: #f5f5f5;
-            }
-            h1 {
-                color: #333;
-            }
-            #messages {
-                background: white;
-                border-radius: 8px;
-                padding: 20px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                min-height: 400px;
-            }
-            .message {
-                padding: 10px;
-                margin: 10px 0;
-                background: #e3f2fd;
-                border-left: 4px solid #2196f3;
-                border-radius: 4px;
-            }
-            .timestamp {
-                color: #666;
-                font-size: 12px;
-                margin-top: 5px;
-            }
-            .status {
-                padding: 10px;
-                margin-bottom: 20px;
-                border-radius: 4px;
-            }
-            .connected {
-                background: #d4edda;
-                color: #155724;
-            }
-            .disconnected {
-                background: #f8d7da;
-                color: #721c24;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>Real-time Messages Display</h1>
-        <div id="status" class="status disconnected">Connecting...</div>
-        <div id="messages"></div>
-
-        <script>
-            const messagesDiv = document.getElementById('messages');
-            const statusDiv = document.getElementById('status');
-            
-            // Connect to WebSocket
-            const ws = new WebSocket('ws://localhost:8000/ws');
-            
-            ws.onopen = () => {
-                statusDiv.textContent = 'Connected - Waiting for messages...';
-                statusDiv.className = 'status connected';
-            };
-            
-            ws.onmessage = (event) => {
-                const messageDiv = document.createElement('div');
-                messageDiv.className = 'message';
-                
-                const now = new Date().toLocaleString();
-                messageDiv.innerHTML = `
-                    <div>${event.data}</div>
-                    <div class="timestamp">${now}</div>
-                `;
-                
-                messagesDiv.insertBefore(messageDiv, messagesDiv.firstChild);
-            };
-            
-            ws.onerror = (error) => {
-                statusDiv.textContent = 'Connection error';
-                statusDiv.className = 'status disconnected';
-            };
-            
-            ws.onclose = () => {
-                statusDiv.textContent = 'Disconnected';
-                statusDiv.className = 'status disconnected';
-            };
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
-
-@app.get("/posture", response_class=HTMLResponse)
-async def get_posture_page():
-    html_content = """
-    <!DOCTYPE html>
+<!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
@@ -208,14 +83,6 @@ async def get_posture_page():
             <div id="filter-info" class="filter-info"></div>
             
             <div class="charts-grid" id="charts-container"></div>
-            
-            <h2 style="margin-top: 40px; text-align: center; color: #333;">60 FPS Interpolated Data (Database Ready)</h2>
-            <div class="info" style="margin-bottom: 20px;">
-                <strong>Interpolation:</strong> Smoothed angles resampled to exactly 60 frames per second using linear interpolation<br>
-                <strong>Purpose:</strong> Consistent frame rate for database storage and analysis<br>
-                <strong>Source:</strong> Applied to filtered/smoothed data (not raw data)
-            </div>
-            <div class="charts-grid" id="interpolated-charts-container"></div>
         </div>
 
         <script>
@@ -286,7 +153,7 @@ async def get_posture_page():
             // ============================================
             const SMOOTHING_CONFIG = {
                 // Choose filter type: 'savgol', 'ema', 'double_ema', 'gaussian', 'kalman', 'hybrid'
-                filterType: 'guassian',
+                filterType: 'gaussian',
                 
                 // Savitzky-Golay settings
                 savgol_windowSize: 7,  // 5, 7, or 9 (larger = smoother but more lag)
@@ -315,32 +182,10 @@ async def get_posture_page():
             const filterInfoDiv = document.getElementById('filter-info');
             const maxDataPoints = 300; // Keep last 300 data points (~10 seconds at 30fps)
             
-            // Display active filter configuration
-            function displayFilterInfo() {
-                const filterDescriptions = {
-                    'savgol': 'Preserves peaks and valleys, best for exercise movements',
-                    'ema': 'Fast response with minimal lag, good for real-time',
-                    'double_ema': 'Handles trends well, good for gradual movements',
-                    'gaussian': 'Heavy noise reduction with smooth curves',
-                    'kalman': 'Optimal for noisy sensor data with prediction',
-                    'hybrid': 'Best overall quality - combines Kalman, Savitzky-Golay, and EMA'
-                };
-                
-                filterInfoDiv.innerHTML = `
-                    <strong>🔧 Active Smoothing Filter:</strong> <code>${SMOOTHING_CONFIG.filterType.toUpperCase()}</code><br>
-                    <strong>Description:</strong> ${filterDescriptions[SMOOTHING_CONFIG.filterType]}<br>
-                    <strong>Update Frequency:</strong> Every ${SMOOTHING_CONFIG.smoothingInterval}ms
-                `;
-            }
-            
-            displayFilterInfo();
-            
             // ============================================
             // SMOOTHING FILTERS
             // ============================================
             
-            // 1. Savitzky-Golay filter (preserves peaks and shape)
-            // Best for: Exercise movements where peak angles matter
             function savitzkyGolayFilter(data, windowSize = 7) {
                 if (!data || data.length < windowSize) return data;
                 
@@ -382,10 +227,7 @@ async def get_posture_page():
                 }
                 
                 return filtered;
-            }
-            
-            // 2. Exponential Moving Average (EMA) - Fast response with smoothing
-            // Best for: Real-time applications with minimal lag
+            }        
             function exponentialMovingAverage(data, alpha = 0.3) {
                 if (!data || data.length === 0) return data;
                 
@@ -406,10 +248,7 @@ async def get_posture_page():
                 }
                 
                 return filtered;
-            }
-            
-            // 3. Double Exponential Smoothing (Holt's method) - Handles trends
-            // Best for: Data with linear trends (e.g., gradual movement changes)
+            }         
             function doubleExponentialSmoothing(data, alpha = 0.3, beta = 0.1) {
                 if (!data || data.length === 0) return data;
                 
@@ -435,9 +274,6 @@ async def get_posture_page():
                 
                 return filtered;
             }
-            
-            // 4. Gaussian Smoothing - Weighted average with Gaussian kernel
-            // Best for: Heavy noise reduction with smooth curves
             function gaussianSmoothing(data, windowSize = 7, sigma = 1.5) {
                 if (!data || data.length < windowSize) return data;
                 
@@ -479,9 +315,6 @@ async def get_posture_page():
                 
                 return filtered;
             }
-            
-            // 5. Kalman Filter (simplified 1D) - Optimal for noisy sensor data
-            // Best for: Real-time tracking with prediction
             function kalmanFilter(data, processNoise = 0.01, measurementNoise = 0.1) {
                 if (!data || data.length === 0) return data;
                 
@@ -513,9 +346,6 @@ async def get_posture_page():
                 
                 return filtered;
             }
-            
-            // 6. Hybrid Filter - Combines multiple filters for best results
-            // Best for: Production use - balances all requirements
             function hybridFilter(data) {
                 // Step 1: Apply Kalman filter for noise reduction
                 let smoothed = kalmanFilter(data, 0.01, 0.1);
@@ -528,97 +358,55 @@ async def get_posture_page():
                 
                 return smoothed;
             }
-            
-            // ============================================
-            // INTERPOLATION FOR 60 FPS
-            // ============================================
-            
-            // Linear interpolation function (from main3.py)
-            function linearInterpolate(xOrig, yOrig, targetCount) {
-                if (xOrig.length < 2 || targetCount < 2) return yOrig;
+            function linearInterpolate(timestamps, values, targetTimestamps) {
+                const interpolated = [];
                 
-                const result = [];
-                const xMin = xOrig[0];
-                const xMax = xOrig[xOrig.length - 1];
-                
-                for (let i = 0; i < targetCount; i++) {
-                    const targetX = xMin + ((xMax - xMin) * i / (targetCount - 1));
-                    
-                    // Find the two surrounding points
-                    let idx = 0;
-                    for (let j = 0; j < xOrig.length - 1; j++) {
-                        if (xOrig[j] <= targetX && targetX <= xOrig[j + 1]) {
-                            idx = j;
-                            break;
-                        }
-                        if (targetX > xOrig[j + 1]) {
-                            idx = j + 1;
-                        }
+                for (const targetTime of targetTimestamps) {
+                    // Find surrounding points
+                    let i = 0;
+                    while (i < timestamps.length - 1 && timestamps[i + 1] < targetTime) {
+                        i++;
                     }
                     
-                    // Handle edge cases
-                    if (idx >= xOrig.length - 1) {
-                        result.push(yOrig[yOrig.length - 1]);
-                        continue;
-                    }
-                    
-                    // Linear interpolation
-                    const x0 = xOrig[idx];
-                    const x1 = xOrig[idx + 1];
-                    const y0 = yOrig[idx];
-                    const y1 = yOrig[idx + 1];
-                    
-                    if (x1 - x0 === 0) {
-                        result.push(y0);
+                    if (i >= timestamps.length - 1) {
+                        // Beyond data range, use last value
+                        interpolated.push(values[values.length - 1]);
+                    } else if (targetTime <= timestamps[0]) {
+                        // Before data range, use first value
+                        interpolated.push(values[0]);
                     } else {
-                        const t = (targetX - x0) / (x1 - x0);
-                        const interpolatedY = y0 + t * (y1 - y0);
-                        result.push(interpolatedY);
+                        // Interpolate between points
+                        const t0 = timestamps[i];
+                        const t1 = timestamps[i + 1];
+                        const v0 = values[i];
+                        const v1 = values[i + 1];
+                        
+                        if (v0 === null || v1 === null) {
+                            interpolated.push(null);
+                        } else {
+                            const ratio = (targetTime - t0) / (t1 - t0);
+                            const interpolatedValue = v0 + ratio * (v1 - v0);
+                            interpolated.push(interpolatedValue);
+                        }
                     }
                 }
                 
-                return result;
+                return interpolated;
             }
             
-            // Resample to 60 FPS for a given time range
-            function resampleTo60FPS(timestamps, smoothedData) {
-                if (timestamps.length < 2) return { timestamps: [], values: [] };
+            // Resample to 30 FPS for a given time range
+            function resampleTo30FPS(timestamps, smoothedData, startTime, endTime) {
+                const fps = 30;
+                const frameInterval = 1.0 / fps;
+                const targetTimestamps = [];
                 
-                const fps = 60;
-                const frameDuration = 1.0 / fps; // 0.01666... seconds per frame
-                const firstTimestamp = timestamps[0];
-                const lastTimestamp = timestamps[timestamps.length - 1];
-                
-                // Align start time to the nearest 60 FPS frame boundary at or before the first timestamp
-                // Find the whole second, then add frame boundaries
-                const wholeSecond = Math.floor(firstTimestamp);
-                const offsetWithinSecond = firstTimestamp - wholeSecond;
-                const frameIndexWithinSecond = Math.floor(offsetWithinSecond / frameDuration);
-                const alignedStartTime = wholeSecond + (frameIndexWithinSecond * frameDuration);
-                
-                // Generate timestamps at exactly 60 FPS from the aligned start
-                const interpolatedTimestamps = [];
-                const interpolatedValues = [];
-                
-                let currentTime = alignedStartTime;
-                while (currentTime <= lastTimestamp) {
-                    interpolatedTimestamps.push(currentTime);
-                    currentTime += frameDuration;
-                }
-                
-                // Use linearInterpolate to get values at these exact timestamps
-                const targetCount = interpolatedTimestamps.length;
-                if (targetCount > 0) {
-                    const values = linearInterpolate(timestamps, smoothedData, targetCount);
-                    return {
-                        timestamps: interpolatedTimestamps,
-                        values: values
-                    };
+                for (let t = startTime; t < endTime; t += frameInterval) {
+                    targetTimestamps.push(t);
                 }
                 
                 return {
-                    timestamps: [],
-                    values: []
+                    timestamps: targetTimestamps,
+                    values: linearInterpolate(timestamps, smoothedData, targetTimestamps)
                 };
             }
             
@@ -663,10 +451,7 @@ async def get_posture_page():
                     userConf: [],
                     trainerConf: [],
                     lastValidUserAngle: null,
-                    lastValidTrainerAngle: null,
-                    interpolated60Timestamps: [],
-                    interpolated60UserAngles: [],
-                    interpolated60TrainerAngles: []
+                    lastValidTrainerAngle: null
                 };
                 
                 // uPlot options
@@ -683,15 +468,7 @@ async def get_posture_page():
                     },
                     series: [
                         {
-                            label: "Time",
-                            value: (u, v) => {
-                                if (v == null) return "-";
-                                const date = new Date(v * 1000);
-                                const minutes = String(date.getMinutes()).padStart(2, '0');
-                                const seconds = String(date.getSeconds()).padStart(2, '0');
-                                const milliseconds = String(date.getMilliseconds()).padStart(3, '0');
-                                return `${minutes}:${seconds}.${milliseconds}`;
-                            }
+                            label: "Time"
                         },
                         {
                             label: "User Angle",
@@ -746,80 +523,6 @@ async def get_posture_page():
                 ];
                 
                 charts[jointKey] = new uPlot(opts, data, container);
-            });
-            
-            // Create interpolated charts (60 FPS)
-            const interpolatedCharts = {};
-            const interpolatedChartsContainer = document.getElementById('interpolated-charts-container');
-            
-            Object.keys(joints).forEach(jointKey => {
-                // Create container
-                const container = document.createElement('div');
-                container.className = 'chart-container';
-                container.innerHTML = `<h3>${joints[jointKey]} (60 FPS)</h3>`;
-                interpolatedChartsContainer.appendChild(container);
-                
-                // uPlot options for interpolated charts
-                const opts = {
-                    width: 400,
-                    height: 200,
-                    scales: {
-                        x: {
-                            time: true
-                        },
-                        y: {
-                            range: [0, 180]
-                        }
-                    },
-                    series: [
-                        {
-                            label: "Time",
-                            value: (u, v) => {
-                                if (v == null) return "-";
-                                const date = new Date(v * 1000);
-                                const minutes = String(date.getMinutes()).padStart(2, '0');
-                                const seconds = String(date.getSeconds()).padStart(2, '0');
-                                const milliseconds = String(date.getMilliseconds()).padStart(3, '0');
-                                return `${minutes}:${seconds}.${milliseconds}`;
-                            }
-                        },
-                        {
-                            label: "User 60 FPS",
-                            stroke: "#9C27B0",
-                            width: 2,
-                            points: { show: false }
-                        },
-                        {
-                            label: "Trainer 60 FPS",
-                            stroke: "#FF9800",
-                            width: 2,
-                            points: { show: false }
-                        }
-                    ],
-                    axes: [
-                        {
-                            stroke: "#64748b",
-                            grid: { stroke: "#e2e8f0", width: 1 }
-                        },
-                        {
-                            stroke: "#64748b",
-                            grid: { stroke: "#e2e8f0", width: 1 },
-                            label: "Angle (°)"
-                        }
-                    ],
-                    legend: {
-                        show: true
-                    }
-                };
-                
-                // Create chart with initial empty data (3 series: timestamps, user 60fps, trainer 60fps)
-                const data = [
-                    [0],
-                    [0],
-                    [0]
-                ];
-                
-                interpolatedCharts[jointKey] = new uPlot(opts, data, container);
             });
             
             function updateCharts(data) {
@@ -1028,39 +731,10 @@ async def get_posture_page():
                             chartData[jointKey].userAngleSmoothed,
                             chartData[jointKey].trainerAngleSmoothed
                         ]);
-                        
-                        // Apply 60 FPS interpolation to smoothed data
-                        if (chartData[jointKey].userAngleSmoothed.length > 1 && 
-                            chartData[jointKey].trainerAngleSmoothed.length > 1) {
-                            
-                            // Resample user smoothed data to 60 FPS
-                            const userResampled = resampleTo60FPS(
-                                chartData[jointKey].timestamps,
-                                chartData[jointKey].userAngleSmoothed
-                            );
-                            
-                            // Resample trainer smoothed data to 60 FPS
-                            const trainerResampled = resampleTo60FPS(
-                                chartData[jointKey].timestamps,
-                                chartData[jointKey].trainerAngleSmoothed
-                            );
-                            
-                            // Store interpolated data for database export
-                            chartData[jointKey].interpolated60Timestamps = userResampled.timestamps;
-                            chartData[jointKey].interpolated60UserAngles = userResampled.values;
-                            chartData[jointKey].interpolated60TrainerAngles = trainerResampled.values;
-                            
-                            // Update interpolated chart
-                            interpolatedCharts[jointKey].setData([
-                                chartData[jointKey].interpolated60Timestamps,
-                                chartData[jointKey].interpolated60UserAngles,
-                                chartData[jointKey].interpolated60TrainerAngles
-                            ]);
-                        }
                     });
                     
                     lastSmoothingTime = now;
-                    console.log(`✨ ${filterName} filter applied + 60 FPS interpolation`);
+                    console.log(`✨ ${filterName} filter applied`);
                 }
             }
             
@@ -1078,65 +752,3 @@ async def get_posture_page():
         </script>
     </body>
     </html>
-    """
-    return HTMLResponse(content=html_content)
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    active_connections.append(websocket)
-    print(f"WebSocket client connected. Total connections: {len(active_connections)}")
-    
-    try:
-        while True:
-            # Receive message from frontend
-            data = await websocket.receive_text()
-            
-            try:
-                # Parse JSON to check if it's batched data
-                parsed_data = json.loads(data)
-                
-                if 'frames' in parsed_data and 'frameCount' in parsed_data:
-                    # Batched data format
-                    frames = parsed_data['frames']
-                    frame_count = parsed_data['frameCount']
-                          
-                    # Process and broadcast each frame individually for plotting
-                    for frame in frames:
-                        frame_json = json.dumps(frame)
-                        
-                        # Broadcast to all connected clients (visualization pages)
-                        for connection in active_connections:
-                            try:
-                                await connection.send_text(frame_json)
-                            except:
-                                pass
-                    
-                else:
-                    # Single frame format (backward compatible)
-                    # print(f"📊 Single frame received: {data[:100]}...")
-                    
-                    # Broadcast to all connected clients
-                    for connection in active_connections:
-                        try:
-                            await connection.send_text(data)
-                        except:
-                            pass
-            
-            except json.JSONDecodeError:
-                # Not JSON, just broadcast as-is (backward compatible)
-                # print(f"Data received (non-JSON): {data}")
-                for connection in active_connections:
-                    try:
-                        await connection.send_text(data)
-                    except:
-                        pass
-            
-    except WebSocketDisconnect:
-        active_connections.remove(websocket)
-        print(f"WebSocket client disconnected. Total connections: {len(active_connections)}")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-        if websocket in active_connections:
-            active_connections.remove(websocket)
-
