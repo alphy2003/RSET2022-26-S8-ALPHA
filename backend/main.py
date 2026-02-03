@@ -2,8 +2,95 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 import json
+import os
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+
+class JointDataStore:
+    """Class to store and manage data for a single joint."""
+    
+    def __init__(self, joint_name):
+        self.joint_name = joint_name
+        self.data = []  # Array to store (timestamp, user_angle, trainer_angle) tuples
+    
+    def add_data_point(self, timestamp, user_angle, trainer_angle):
+        """Add a single data point to the array."""
+        self.data.append((timestamp, user_angle, trainer_angle))
+    
+    def get_all_data(self):
+        """Return all data points."""
+        return self.data
+    
+    def get_last_n_points(self, n):
+        """Return the last N data points."""
+        return self.data[-n:] if len(self.data) >= n else self.data
+    
+    def display_all_data(self):
+        """Display all data points in terminal."""
+        print(f"\n{'='*80}")
+        print(f"Joint: {self.joint_name}")
+        print(f"Total points: {len(self.data)}")
+        print(f"{'='*80}")
+        if self.data:
+            print(f"{'Index':<8} {'Timestamp':<18} {'User Angle':<15} {'Trainer Angle':<15}")
+            print('-' * 80)
+            for i, (ts, user_ang, trainer_ang) in enumerate(self.data):
+                print(f"{i:<8} {ts:<18.3f} {user_ang:<15.2f} {trainer_ang:<15.2f}")
+        else:
+            print("No data available")
+        print(f"{'='*80}\n")
+    
+    def display_last_n_points(self, n):
+        """Display the last N data points in terminal."""
+        last_points = self.get_last_n_points(n)
+        print(f"\n{'='*80}")
+        print(f"Joint: {self.joint_name}")
+        print(f"Showing last {len(last_points)} of {len(self.data)} points")
+        print(f"{'='*80}")
+        if last_points:
+            print(f"{'Index':<8} {'Timestamp':<18} {'User Angle':<15} {'Trainer Angle':<15}")
+            print('-' * 80)
+            start_idx = len(self.data) - len(last_points)
+            for i, (ts, user_ang, trainer_ang) in enumerate(last_points, start=start_idx):
+                print(f"{i:<8} {ts:<18.3f} {user_ang:<15.2f} {trainer_ang:<15.2f}")
+        else:
+            print("No data available")
+        print(f"{'='*80}\n")
+    
+    def clear_data(self):
+        """Clear all data points."""
+        self.data.clear()
+    
+    def get_data_count(self):
+        """Return the number of data points stored."""
+        return len(self.data)
+
+
+# List of all joint names
+JOINT_NAMES = [
+    "Left Shoulder", "Left Elbow", "Left Wrist",
+    "Right Shoulder", "Right Elbow", "Right Wrist",
+    "Left Hip", "Left Knee", "Left Ankle",
+    "Right Hip", "Right Knee", "Right Ankle",
+    "Left Spine", "Right Spine", "Neck"
+]
+
+# Initialize data stores for all joints
+joint_data_stores = {joint_name: JointDataStore(joint_name) for joint_name in JOINT_NAMES}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("✅ In-memory data storage initialized")
+    print(f"📊 Tracking {len(JOINT_NAMES)} joints")
+    
+    yield
+    
+    # Shutdown
+    print("🔒 Shutting down server")
+
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -19,7 +106,7 @@ active_connections: list[WebSocket] = []
 
 @app.get("/")
 def read_root():
-    return {"hello"}
+    return RedirectResponse(url="/posture")
 
 @app.get("/messages", response_class=HTMLResponse)
 async def get_messages_page():
@@ -122,6 +209,11 @@ async def get_messages_page():
 
 @app.get("/posture", response_class=HTMLResponse)
 async def get_posture_page():
+    # Clear all data for fresh workout session
+    for joint_store in joint_data_stores.values():
+        joint_store.clear_data()
+    print("🗑️  All in-memory data cleared for new workout session")
+    
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
@@ -1004,7 +1096,9 @@ async def get_posture_page():
                             break;
                     }
                     
-                    // Apply the selected filter to all joints
+                    // Apply the selected filter to all joints and collect interpolated data
+                    const interpolatedDataByTimestamp = {};
+                    
                     Object.keys(joints).forEach(jointKey => {
                         // Apply selected filter to user angles
                         if (chartData[jointKey].userAngles.length > 0) {
@@ -1056,7 +1150,35 @@ async def get_posture_page():
                                 chartData[jointKey].interpolated60UserAngles,
                                 chartData[jointKey].interpolated60TrainerAngles
                             ]);
+                            
+                            // Collect data organized by timestamp
+                            for (let i = 0; i < userResampled.timestamps.length; i++) {
+                                const timestamp = userResampled.timestamps[i];
+                                if (!interpolatedDataByTimestamp[timestamp]) {
+                                    interpolatedDataByTimestamp[timestamp] = [];
+                                }
+                                interpolatedDataByTimestamp[timestamp].push({
+                                    joint: joints[jointKey],
+                                    userAngle: userResampled.values[i],
+                                    trainerAngle: trainerResampled.values[i]
+                                });
+                            }
                         }
+                    });
+                    
+                    // Send data grouped by timestamp (all 15 joints for each timestamp together)
+                    Object.keys(interpolatedDataByTimestamp).forEach(timestamp => {
+                        const jointsData = interpolatedDataByTimestamp[timestamp];
+                        // Send all joints data for this timestamp in one message
+                        jointsData.forEach(jointData => {
+                            ws.send(JSON.stringify({
+                                type: 'interpolated_data',
+                                joint: jointData.joint,
+                                timestamp: parseFloat(timestamp),
+                                userAngle: Math.round(jointData.userAngle),
+                                trainerAngle: Math.round(jointData.trainerAngle)
+                            }));
+                        });
                     });
                     
                     lastSmoothingTime = now;
@@ -1081,20 +1203,79 @@ async def get_posture_page():
     """
     return HTMLResponse(content=html_content)
 
+
+@app.get("/view-joint/{joint_name}")
+async def view_joint_data(joint_name: str, last_n: int = None):
+    """
+    View data for a specific joint. Returns array of (trainer_angle, user_angle) pairs.
+    
+    Examples:
+    - http://localhost:8000/view-joint/Left Shoulder
+    - http://localhost:8000/view-joint/Left Knee?last_n=50
+    """
+    if joint_name not in joint_data_stores:
+        return {"error": "Joint not found", "available_joints": JOINT_NAMES}
+    
+    store = joint_data_stores[joint_name]
+    
+    # Get data from array
+    data = store.get_last_n_points(last_n) if last_n else store.get_all_data()
+    
+    # Transform to (trainer_angle, user_angle) format
+    angle_pairs = [(trainer_ang, user_ang) for _, user_ang, trainer_ang in data]
+    
+    # Return just the angle pairs array
+    return {
+        "joint": joint_name,
+        "count": store.get_data_count(),
+        "data": angle_pairs
+    }
+
+
+@app.get("/summary")
+async def view_summary():
+    """View summary of all joints with data counts."""
+    summary = {joint: store.get_data_count() for joint, store in joint_data_stores.items()}
+    
+    print("\n" + "="*60)
+    print("SUMMARY - All Joints Data Count")
+    print("="*60)
+    for joint, count in summary.items():
+        print(f"{joint:<20}: {count:>6} points")
+    print("="*60 + "\n")
+    
+    return summary
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # Accept connection with custom max_size for large messages (500 MB)
     await websocket.accept()
+    
     active_connections.append(websocket)
     print(f"WebSocket client connected. Total connections: {len(active_connections)}")
     
     try:
         while True:
-            # Receive message from frontend
+            # Receive message from frontend (no timeout - indefinite connection)
             data = await websocket.receive_text()
             
             try:
                 # Parse JSON to check if it's batched data
                 parsed_data = json.loads(data)
+                
+                # Check if this is interpolated data for in-memory storage
+                if parsed_data.get('type') == 'interpolated_data':
+                    # Store in memory
+                    joint_name = parsed_data['joint']
+                    if joint_name in joint_data_stores:
+                        joint_data_stores[joint_name].add_data_point(
+                            parsed_data['timestamp'],
+                            parsed_data['userAngle'],
+                            parsed_data['trainerAngle']
+                        )
+                    # Skip broadcasting this to other clients
+                    continue
                 
                 if 'frames' in parsed_data and 'frameCount' in parsed_data:
                     # Batched data format

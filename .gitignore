@@ -17,6 +17,7 @@ pip-delete-this-directory.txt
 # Backend specific
 backend/__pycache__/
 backend/*.pyc
+backend/workout_data.db
 
 # Node modules
 node_modules/
