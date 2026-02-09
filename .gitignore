@@ -83,3 +83,17 @@ coverage/
 *.tmp
 *.temp
 ~*
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+env.bak/
+venv.bak/
+bin/
+include/
+lib/
+share/
+pyvenv.cfg

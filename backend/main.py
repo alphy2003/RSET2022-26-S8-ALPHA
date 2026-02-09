@@ -4,18 +4,19 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 import json
 import os
 from contextlib import asynccontextmanager
+import statistics
 
 
 class JointDataStore:
-    """Class to store and manage data for a single joint."""
+    """Class to store and manage data for a single joint (trainer or user)."""
     
     def __init__(self, joint_name):
         self.joint_name = joint_name
-        self.data = []  # Array to store (timestamp, user_angle, trainer_angle) tuples
+        self.data = []  # Flat array to store angle values only
     
-    def add_data_point(self, timestamp, user_angle, trainer_angle):
-        """Add a single data point to the array."""
-        self.data.append((timestamp, user_angle, trainer_angle))
+    def add_data_point(self, angle):
+        """Add a single angle value to the array."""
+        self.data.append(angle)
     
     def get_all_data(self):
         """Return all data points."""
@@ -25,6 +26,64 @@ class JointDataStore:
         """Return the last N data points."""
         return self.data[-n:] if len(self.data) >= n else self.data
     
+    def find_std_deviation(self, seconds=None):
+        """Calculate standard deviation.
+        
+        Args:
+            seconds: If None, use all data. Otherwise, use last seconds*60 elements.
+        
+        Returns:
+            Standard deviation of the specified data range, or None if insufficient data.
+        """
+        if seconds is None:
+            # Use all data
+            data_to_analyze = self.data
+        else:
+            # Use last seconds*60 elements
+            num_elements = seconds * 60
+            data_to_analyze = self.data[-num_elements:] if len(self.data) >= num_elements else self.data
+        
+        if len(data_to_analyze) < 2:
+            return None
+        
+        return statistics.stdev(data_to_analyze)
+    
+    def find_average(self, seconds=None):
+        """Calculate average/mean.
+        
+        Args:
+            seconds: If None, use all data. Otherwise, use last seconds*60 elements.
+        
+        Returns:
+            Average of the specified data range, or -1 if insufficient data.
+        """
+        if seconds is None:
+            # Use all data
+            data_to_analyze = self.data
+        else:
+            # Use last seconds*60 elements
+            num_elements = seconds * 60
+            if len(self.data) < num_elements:
+                return -1
+            data_to_analyze = self.data[-num_elements:]
+        
+        if len(data_to_analyze) == 0:
+            return -1
+        
+        return statistics.mean(data_to_analyze)
+    
+    def count_reps(self):
+        """Count repetitions in the angle data.
+        
+        Returns:
+            Number of repetitions detected in the signal.
+        
+        TODO: Implement peak detection or threshold crossing algorithm.
+        """
+        # Placeholder implementation
+        # TODO: Implement actual rep counting algorithm (e.g., peak detection)
+        return 0
+    
     def display_all_data(self):
         """Display all data points in terminal."""
         print(f"\n{'='*80}")
@@ -32,10 +91,10 @@ class JointDataStore:
         print(f"Total points: {len(self.data)}")
         print(f"{'='*80}")
         if self.data:
-            print(f"{'Index':<8} {'Timestamp':<18} {'User Angle':<15} {'Trainer Angle':<15}")
+            print(f"{'Index':<8} {'Angle':<15}")
             print('-' * 80)
-            for i, (ts, user_ang, trainer_ang) in enumerate(self.data):
-                print(f"{i:<8} {ts:<18.3f} {user_ang:<15.2f} {trainer_ang:<15.2f}")
+            for i, angle in enumerate(self.data):
+                print(f"{i:<8} {angle:<15.2f}")
         else:
             print("No data available")
         print(f"{'='*80}\n")
@@ -48,11 +107,11 @@ class JointDataStore:
         print(f"Showing last {len(last_points)} of {len(self.data)} points")
         print(f"{'='*80}")
         if last_points:
-            print(f"{'Index':<8} {'Timestamp':<18} {'User Angle':<15} {'Trainer Angle':<15}")
+            print(f"{'Index':<8} {'Angle':<15}")
             print('-' * 80)
             start_idx = len(self.data) - len(last_points)
-            for i, (ts, user_ang, trainer_ang) in enumerate(last_points, start=start_idx):
-                print(f"{i:<8} {ts:<18.3f} {user_ang:<15.2f} {trainer_ang:<15.2f}")
+            for i, angle in enumerate(last_points, start=start_idx):
+                print(f"{i:<8} {angle:<15.2f}")
         else:
             print("No data available")
         print(f"{'='*80}\n")
@@ -75,20 +134,150 @@ JOINT_NAMES = [
     "Left Spine", "Right Spine", "Neck"
 ]
 
-# Initialize data stores for all joints
-joint_data_stores = {joint_name: JointDataStore(joint_name) for joint_name in JOINT_NAMES}
+# Initialize separate data stores for trainer and user
+trainer_joint_data_stores = {f"t_{joint_name}": JointDataStore(f"t_{joint_name}") for joint_name in JOINT_NAMES}
+user_joint_data_stores = {f"u_{joint_name}": JointDataStore(f"u_{joint_name}") for joint_name in JOINT_NAMES}
+
+
+class WorkoutAnalyzer:
+    """Class for analyzing data across multiple joints."""
+    
+    def __init__(self, trainer_stores, user_stores):
+        self.trainer_stores = trainer_stores
+        self.user_stores = user_stores
+    
+    def find_primary_angles(self, use_trainer=False, seconds=None):
+        """Find primary angles based on standard deviation analysis.
+        
+        Algorithm:
+        1. Calculate std deviation for all joints (excluding wrists)
+        2. Auto-include joints with std deviation > 80 (high movement)
+        3. Sort remaining joints by std deviation in descending order
+        4. Find max difference between consecutive joints
+        5. All joints above the max difference are considered primary angles
+        
+        Args:
+            use_trainer: If True, analyze trainer data. Otherwise, analyze user data.
+            seconds: If provided, only consider data from the last N seconds.
+                    If None, use all available data.
+        
+        Returns:
+            List of joint names that are primary angles.
+        """
+        stores = self.trainer_stores if use_trainer else self.user_stores
+        
+        # Calculate std deviation for all joints (excluding wrists)
+        joint_std_pairs = []
+        high_movement_joints = []  # Joints with std > 80
+        
+        for joint_name, store in stores.items():
+            std_dev = store.find_std_deviation(seconds=seconds)
+            if std_dev is not None:
+                # Exclude wrist angles from primary angle detection
+                if "Wrist" in joint_name:
+                    continue
+                
+                # Auto-include joints with very high movement (std > 80)
+                if std_dev > 80:
+                    high_movement_joints.append(joint_name)
+                else:
+                    joint_std_pairs.append((joint_name, std_dev))
+        
+        # If we only have high movement joints, return them
+        if len(joint_std_pairs) < 2:
+            return high_movement_joints
+        
+        # Sort by std deviation in descending order
+        joint_std_pairs.sort(key=lambda x: x[1], reverse=True)
+        
+        # Find max difference between consecutive joints
+        max_diff = 0
+        max_diff_index = 0
+        for i in range(len(joint_std_pairs) - 1):
+            diff = joint_std_pairs[i][1] - joint_std_pairs[i + 1][1]
+            if diff > max_diff:
+                max_diff = diff
+                max_diff_index = i
+        
+        # All joints above (and including) the max difference index are primary
+        primary_angles = [joint_name for joint_name, _ in joint_std_pairs[:max_diff_index + 1]]
+        
+        # Combine high movement joints with detected primary angles
+        return high_movement_joints + primary_angles
+    
+    def get_all_joint_std_deviations(self, use_trainer=False, seconds=None):
+        """Get standard deviation for all joints sorted by value.
+        
+        Args:
+            use_trainer: If True, analyze trainer data. Otherwise, analyze user data.
+            seconds: If provided, only consider data from the last N seconds.
+        
+        Returns:
+            List of tuples (joint_name, std_dev) sorted by std_dev descending.
+        """
+        stores = self.trainer_stores if use_trainer else self.user_stores
+        
+        joint_std_list = []
+        for joint_name, store in stores.items():
+            std_dev = store.find_std_deviation(seconds=seconds)
+            if std_dev is not None:
+                joint_std_list.append((joint_name, std_dev))
+        
+        # Sort by std deviation in descending order
+        joint_std_list.sort(key=lambda x: x[1], reverse=True)
+        
+        return joint_std_list
+    
+    def verify_reps_across_primary_angles(self, use_trainer=False, seconds=None):
+        """Verify repetition counts across primary angles.
+        
+        This method combines rep data from all primary angles to validate
+        and provide a consensus rep count.
+        
+        Args:
+            use_trainer: If True, analyze trainer data. Otherwise, analyze user data.
+            seconds: If provided, only consider data from the last N seconds.
+        
+        Returns:
+            Dictionary with verified rep count and per-joint breakdown.
+        
+        TODO: Implement cross-joint rep verification algorithm.
+        """
+        primary_angles = self.find_primary_angles(use_trainer=use_trainer, seconds=seconds)
+        stores = self.trainer_stores if use_trainer else self.user_stores
+        
+        # Get rep counts from each primary angle
+        rep_counts = {}
+        for angle_name in primary_angles:
+            # Add prefix back to get the store key
+            prefix = 't_' if use_trainer else 'u_'
+            store_key = f"{prefix}{angle_name}"
+            if store_key in stores:
+                rep_counts[angle_name] = stores[store_key].count_reps()
+        
+        # Placeholder implementation
+        # TODO: Implement consensus algorithm (e.g., median, voting, temporal alignment)
+        verified_count = 0
+        if rep_counts:
+            verified_count = max(rep_counts.values()) if rep_counts else 0
+        
+        return {
+            "verified_count": verified_count,
+            "primary_angles": primary_angles,
+            "individual_counts": rep_counts
+        }
+
+
+# Initialize workout analyzer
+workout_analyzer = WorkoutAnalyzer(trainer_joint_data_stores, user_joint_data_stores)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     print("✅ In-memory data storage initialized")
-    print(f"📊 Tracking {len(JOINT_NAMES)} joints")
-    
     yield
     
-    # Shutdown
-    print("🔒 Shutting down server")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -108,111 +297,11 @@ active_connections: list[WebSocket] = []
 def read_root():
     return RedirectResponse(url="/posture")
 
-@app.get("/messages", response_class=HTMLResponse)
-async def get_messages_page():
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Messages Display</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                max-width: 800px;
-                margin: 50px auto;
-                padding: 20px;
-                background-color: #f5f5f5;
-            }
-            h1 {
-                color: #333;
-            }
-            #messages {
-                background: white;
-                border-radius: 8px;
-                padding: 20px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                min-height: 400px;
-            }
-            .message {
-                padding: 10px;
-                margin: 10px 0;
-                background: #e3f2fd;
-                border-left: 4px solid #2196f3;
-                border-radius: 4px;
-            }
-            .timestamp {
-                color: #666;
-                font-size: 12px;
-                margin-top: 5px;
-            }
-            .status {
-                padding: 10px;
-                margin-bottom: 20px;
-                border-radius: 4px;
-            }
-            .connected {
-                background: #d4edda;
-                color: #155724;
-            }
-            .disconnected {
-                background: #f8d7da;
-                color: #721c24;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>Real-time Messages Display</h1>
-        <div id="status" class="status disconnected">Connecting...</div>
-        <div id="messages"></div>
-
-        <script>
-            const messagesDiv = document.getElementById('messages');
-            const statusDiv = document.getElementById('status');
-            
-            // Connect to WebSocket
-            const ws = new WebSocket('ws://localhost:8000/ws');
-            
-            ws.onopen = () => {
-                statusDiv.textContent = 'Connected - Waiting for messages...';
-                statusDiv.className = 'status connected';
-            };
-            
-            ws.onmessage = (event) => {
-                const messageDiv = document.createElement('div');
-                messageDiv.className = 'message';
-                
-                const now = new Date().toLocaleString();
-                messageDiv.innerHTML = `
-                    <div>${event.data}</div>
-                    <div class="timestamp">${now}</div>
-                `;
-                
-                messagesDiv.insertBefore(messageDiv, messagesDiv.firstChild);
-            };
-            
-            ws.onerror = (error) => {
-                statusDiv.textContent = 'Connection error';
-                statusDiv.className = 'status disconnected';
-            };
-            
-            ws.onclose = () => {
-                statusDiv.textContent = 'Disconnected';
-                statusDiv.className = 'status disconnected';
-            };
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
-
 @app.get("/posture", response_class=HTMLResponse)
 async def get_posture_page():
     # Clear all data for fresh workout session
-    for joint_store in joint_data_stores.values():
-        joint_store.clear_data()
-    print("🗑️  All in-memory data cleared for new workout session")
+    for store in list(trainer_joint_data_stores.values()) + list(user_joint_data_stores.values()):
+        store.clear_data()
     
     html_content = """
     <!DOCTYPE html>
@@ -1181,8 +1270,14 @@ async def get_posture_page():
                         });
                     });
                     
+                    // Send completion notification
+                    ws.send(JSON.stringify({
+                        type: 'interpolation_complete',
+                        timestamp: Date.now() / 1000
+                    }));
+                    
                     lastSmoothingTime = now;
-                    console.log(`✨ ${filterName} filter applied + 60 FPS interpolation`);
+                    console.log(`✨ ${filterName} filter applied + 60 FPS interpolation + notification sent`);
                 }
             }
             
@@ -1205,46 +1300,262 @@ async def get_posture_page():
 
 
 @app.get("/view-joint/{joint_name}")
-async def view_joint_data(joint_name: str, last_n: int = None):
+async def view_joint_data(joint_name: str, role: str = "both", last_n: int = None):
     """
-    View data for a specific joint. Returns array of (trainer_angle, user_angle) pairs.
+    View data for a specific joint.
+    
+    Args:
+        joint_name: Base joint name (e.g., 'Left Shoulder')
+        role: 'trainer', 'user', or 'both' (default)
+        last_n: Optional limit on number of points to return
     
     Examples:
     - http://localhost:8000/view-joint/Left Shoulder
-    - http://localhost:8000/view-joint/Left Knee?last_n=50
+    - http://localhost:8000/view-joint/Left Knee?role=user&last_n=50
     """
-    if joint_name not in joint_data_stores:
-        return {"error": "Joint not found", "available_joints": JOINT_NAMES}
+    trainer_key = f"t_{joint_name}"
+    user_key = f"u_{joint_name}"
     
-    store = joint_data_stores[joint_name]
+    result = {"joint": joint_name}
     
-    # Get data from array
-    data = store.get_last_n_points(last_n) if last_n else store.get_all_data()
+    if role in ["trainer", "both"]:
+        if trainer_key in trainer_joint_data_stores:
+            store = trainer_joint_data_stores[trainer_key]
+            data = store.get_last_n_points(last_n) if last_n else store.get_all_data()
+            result["trainer"] = {
+                "count": store.get_data_count(),
+                "data": data
+            }
+        else:
+            result["trainer"] = {"error": "Trainer joint not found"}
     
-    # Transform to (trainer_angle, user_angle) format
-    angle_pairs = [(trainer_ang, user_ang) for _, user_ang, trainer_ang in data]
+    if role in ["user", "both"]:
+        if user_key in user_joint_data_stores:
+            store = user_joint_data_stores[user_key]
+            data = store.get_last_n_points(last_n) if last_n else store.get_all_data()
+            result["user"] = {
+                "count": store.get_data_count(),
+                "data": data
+            }
+        else:
+            result["user"] = {"error": "User joint not found"}
     
-    # Return just the angle pairs array
-    return {
-        "joint": joint_name,
-        "count": store.get_data_count(),
-        "data": angle_pairs
-    }
+    if role not in ["trainer", "user", "both"]:
+        return {
+            "error": "Invalid role. Use 'trainer', 'user', or 'both'",
+            "available_joints": JOINT_NAMES
+        }
+    
+    return result
 
 
 @app.get("/summary")
 async def view_summary():
     """View summary of all joints with data counts."""
-    summary = {joint: store.get_data_count() for joint, store in joint_data_stores.items()}
+    trainer_summary = {joint: store.get_data_count() for joint, store in trainer_joint_data_stores.items()}
+    user_summary = {joint: store.get_data_count() for joint, store in user_joint_data_stores.items()}
     
     print("\n" + "="*60)
     print("SUMMARY - All Joints Data Count")
     print("="*60)
-    for joint, count in summary.items():
-        print(f"{joint:<20}: {count:>6} points")
+    print("\nTRAINER:")
+    for joint, count in trainer_summary.items():
+        print(f"{joint:<25}: {count:>6} points")
+    print("\nUSER:")
+    for joint, count in user_summary.items():
+        print(f"{joint:<25}: {count:>6} points")
     print("="*60 + "\n")
     
-    return summary
+    return {
+        "trainer": trainer_summary,
+        "user": user_summary
+    }
+
+
+@app.get("/api/primary-angles-data")
+async def get_primary_angles_data(role: str = "user", seconds: int = None):
+    """
+    API endpoint to get primary angles JSON data.
+    
+    Args:
+        role: 'trainer' or 'user' (default: 'user')
+        seconds: Optional. Analyze only the last N seconds of data.
+    
+    Returns:
+        JSON with primary angles data including std deviations.
+    """
+    use_trainer = (role == "trainer")
+    primary_angles = workout_analyzer.find_primary_angles(use_trainer=use_trainer, seconds=seconds)
+    all_joint_std = workout_analyzer.get_all_joint_std_deviations(use_trainer=use_trainer, seconds=seconds)
+    
+    # Format all joints with std dev
+    all_joints_detailed = [
+        {
+            "joint": joint_name, 
+            "std_dev": round(std_dev, 0),
+            "is_primary": joint_name in primary_angles
+        } 
+        for joint_name, std_dev in all_joint_std
+    ]
+    
+    return {
+        "role": role,
+        "primary_angles": primary_angles,
+        "count": len(primary_angles),
+        "analyzed_seconds": seconds if seconds else "all",
+        "all_joints": all_joints_detailed
+    }
+
+
+@app.get("/api/primary-angles", response_class=HTMLResponse)
+async def get_primary_angles(role: str = "user", seconds: int = None):
+    """
+    Display primary angles in a simple HTML table.
+    
+    Args:
+        role: 'trainer' or 'user' (default: 'user')
+        seconds: Optional. Analyze only the last N seconds of data.
+    
+    Example:
+    - http://localhost:8000/api/primary-angles
+    - http://localhost:8000/api/primary-angles?role=trainer
+    - http://localhost:8000/api/primary-angles?role=user&seconds=5
+    """
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Primary Angles</title>
+    </head>
+    <body>
+        <h1>Primary Angles Analysis</h1>
+        <p>Role: <strong id="role"></strong> | Primary Angles: <strong id="count"></strong> | Time Window: <strong id="seconds"></strong></p>
+        <p>Last Updated: <span id="last-updated"></span></p>
+        
+        <h2>All Joints (Sorted by Standard Deviation)</h2>
+        <table border="1" id="std-table">
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Joint Name</th>
+                    <th>Std Deviation</th>
+                    <th>Primary Angle</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td colspan="4">Loading...</td></tr>
+            </tbody>
+        </table>
+        
+        <h2>JSON Response</h2>
+        <pre id="json-display">Loading...</pre>
+
+        <script>
+            const role = "{role}";
+            const seconds = {seconds if seconds else 'null'};
+            
+            // WebSocket connection for real-time updates
+            const ws = new WebSocket('ws://localhost:8000/ws');
+            
+            ws.onopen = () => {{
+                console.log('✅ Connected to backend via WebSocket');
+                fetchPrimaryAngles(); // Initial fetch
+            }};
+            
+            ws.onmessage = (event) => {{
+                try {{
+                    const data = JSON.parse(event.data);
+                    
+                    // Only update when interpolation completes
+                    if (data.type === 'primary_angles_updated') {{
+                        console.log('🔔 Received update notification at:', data.timestamp);
+                        fetchPrimaryAngles(); // Update immediately
+                    }}
+                }} catch (e) {{
+                    console.error('Parse error:', e);
+                }}
+            }};
+            
+            ws.onerror = (error) => {{
+                console.error('WebSocket error:', error);
+            }};
+            
+            ws.onclose = () => {{
+                console.log('❌ Disconnected from backend');
+                document.getElementById('last-updated').textContent = 'Disconnected - Retrying...';
+                // Retry connection after 2 seconds
+                setTimeout(() => location.reload(), 2000);
+            }};
+            
+            async function fetchPrimaryAngles() {{
+                try {{
+                    const url = `/api/primary-angles-data?role=${{role}}${{seconds !== null ? '&seconds=' + seconds : ''}}`;
+                    const response = await fetch(url);
+                    const data = await response.json();
+                    
+                    // Update info
+                    document.getElementById('role').textContent = data.role.toUpperCase();
+                    document.getElementById('count').textContent = data.count;
+                    document.getElementById('seconds').textContent = data.analyzed_seconds === 'all' ? 'All Data' : data.analyzed_seconds + ' seconds';
+                    
+                    // Update table
+                    const tbody = document.querySelector('#std-table tbody');
+                    if (data.all_joints && data.all_joints.length > 0) {{
+                        let rows = '';
+                        data.all_joints.forEach((joint, index) => {{
+                            rows += `<tr>
+                                <td>${{index + 1}}</td>
+                                <td>${{joint.joint}}</td>
+                                <td>${{joint.std_dev.toFixed(2)}}</td>
+                                <td>${{joint.is_primary ? 'YES' : 'NO'}}</td>
+                            </tr>`;
+                        }});
+                        tbody.innerHTML = rows;
+                    }} else {{
+                        tbody.innerHTML = '<tr><td colspan="4">No data available</td></tr>';
+                    }}
+                    
+                    // Update JSON
+                    document.getElementById('json-display').textContent = JSON.stringify(data, null, 2);
+                    
+                    // Update timestamp
+                    document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+                    
+                    console.log('📊 Updated primary angles:', data.primary_angles);
+                }} catch (error) {{
+                    document.getElementById('json-display').textContent = 'Error: ' + error.message;
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/api/verify-reps")
+async def verify_reps(role: str = "user", seconds: int = None):
+    """
+    Verify repetition counts across primary angles.
+    
+    Args:
+        role: 'trainer' or 'user' (default: 'user')
+        seconds: Optional. Analyze only the last N seconds of data.
+    
+    Returns:
+        Dictionary with verified rep count and per-joint breakdown.
+    
+    Example:
+    - http://localhost:8000/api/verify-reps
+    - http://localhost:8000/api/verify-reps?role=trainer
+    - http://localhost:8000/api/verify-reps?role=user&seconds=10
+    """
+    use_trainer = (role == "trainer")
+    result = workout_analyzer.verify_reps_across_primary_angles(use_trainer=use_trainer, seconds=seconds)
+    result["role"] = role
+    
+    return result
 
 
 @app.websocket("/ws")
@@ -1266,15 +1577,40 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Check if this is interpolated data for in-memory storage
                 if parsed_data.get('type') == 'interpolated_data':
-                    # Store in memory
+                    # Store in memory - separate trainer and user data
                     joint_name = parsed_data['joint']
-                    if joint_name in joint_data_stores:
-                        joint_data_stores[joint_name].add_data_point(
-                            parsed_data['timestamp'],
-                            parsed_data['userAngle'],
-                            parsed_data['trainerAngle']
-                        )
+                    trainer_angle = parsed_data.get('trainerAngle')
+                    user_angle = parsed_data.get('userAngle')
+                    
+                    # Store trainer data
+                    trainer_key = f"t_{joint_name}"
+                    if trainer_key in trainer_joint_data_stores and trainer_angle is not None:
+                        trainer_joint_data_stores[trainer_key].add_data_point(trainer_angle)
+                    
+                    # Store user data
+                    user_key = f"u_{joint_name}"
+                    if user_key in user_joint_data_stores and user_angle is not None:
+                        user_joint_data_stores[user_key].add_data_point(user_angle)
+                    
                     # Skip broadcasting this to other clients
+                    continue
+                
+                # Handle interpolation completion notification
+                if parsed_data.get('type') == 'interpolation_complete':
+                    print(f"✅ Interpolation complete at {parsed_data.get('timestamp')}")
+                    
+                    # Broadcast to all connected clients (Primary Angles page)
+                    notification = json.dumps({
+                        "type": "primary_angles_updated",
+                        "timestamp": parsed_data.get('timestamp')
+                    })
+                    
+                    for connection in active_connections:
+                        try:
+                            await connection.send_text(notification)
+                        except:
+                            pass
+                    
                     continue
                 
                 if 'frames' in parsed_data and 'frameCount' in parsed_data:
