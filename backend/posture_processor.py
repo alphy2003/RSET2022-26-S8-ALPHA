@@ -267,6 +267,15 @@ class JointDataStore:
         self.last_interpolated_index: int = 0      # Track which raw data index we last interpolated up to
         self.last_interpolated_timestamp: float = 0.0  # Last 60 FPS timestamp we generated
         
+        # Cumulative average tracking (batch-based for efficiency)
+        self.cumulative_average: Optional[float] = None  # Running average of all raw angles from start
+        self.raw_angles_count: int = 0                  # Count of raw angles used in cumulative average
+        self.batch_buffer: List[float] = []             # Temporary buffer for current batch angles
+        self.statistics_reset_index: int = 0            # Index in interpolated_filtered where statistics were last reset
+        
+        # Cumulative standard deviation tracking
+        self.cumulative_sum_of_squares: float = 0.0     # Running sum of squared values for std dev calculation
+        
         # Create incremental filter instance (maintains state, no reprocessing)
         self.filter = create_incremental_filter(
             SMOOTHING_CONFIG['filter_type'],
@@ -288,6 +297,9 @@ class JointDataStore:
         # Apply filter incrementally (O(1) or O(window_size), no reprocessing)
         smoothed = self.filter.update(angle)
         self.angles_smoothed.append(smoothed)
+        
+        # Add to batch buffer for cumulative average calculation
+        self.batch_buffer.append(angle)
         
         # Auto-interpolate after adding data
         self._update_interpolation()
@@ -413,6 +425,179 @@ class JointDataStore:
         self.last_interpolated_index = current_data_count - 1
         self.last_interpolated_timestamp = new_interpolated_timestamps[-1]
     
+    def finalize_batch(self):
+        """
+        Finalize the current batch by updating cumulative average.
+        This should be called after a batch of data points has been added.
+        Uses weighted average formula to efficiently update the cumulative average.
+        """
+        if len(self.batch_buffer) == 0:
+            return  # No new data in this batch
+        
+        # Calculate average and sum of squares of current batch
+        batch_avg = sum(self.batch_buffer) / len(self.batch_buffer)
+        batch_count = len(self.batch_buffer)
+        batch_sum_of_squares = sum(x * x for x in self.batch_buffer)
+        
+        # Update cumulative average using weighted formula
+        if self.cumulative_average is None:
+            # First batch
+            self.cumulative_average = batch_avg
+            self.raw_angles_count = batch_count
+            self.cumulative_sum_of_squares = batch_sum_of_squares
+        else:
+            # Weighted average: new_avg = (old_avg * old_count + batch_avg * batch_count) / (old_count + batch_count)
+            self.cumulative_average = (
+                (self.cumulative_average * self.raw_angles_count) + (batch_avg * batch_count)
+            ) / (self.raw_angles_count + batch_count)
+            self.raw_angles_count += batch_count
+            self.cumulative_sum_of_squares += batch_sum_of_squares
+        
+        # Clear the batch buffer
+        self.batch_buffer.clear()
+    
+    def get_cumulative_average(self) -> Optional[float]:
+        """Get the cumulative average of all raw angles from start (rounded to integer)"""
+        if self.cumulative_average is not None:
+            return round(self.cumulative_average)
+        return None
+    
+    def get_cumulative_average_precise(self) -> Optional[float]:
+        """Get the precise cumulative average (not rounded)"""
+        return self.cumulative_average
+    
+    def get_cumulative_std_dev(self) -> Optional[float]:
+        """Get the cumulative standard deviation of all raw angles from start (rounded to 2 decimal places)"""
+        if self.cumulative_average is not None and self.raw_angles_count > 0:
+            # Calculate variance: var = (sum(x^2) / n) - mean^2
+            mean_of_squares = self.cumulative_sum_of_squares / self.raw_angles_count
+            variance = mean_of_squares - (self.cumulative_average ** 2)
+            # Handle floating point errors that might make variance slightly negative
+            variance = max(0, variance)
+            std_dev = variance ** 0.5
+            return round(std_dev, 2)
+        return None
+    
+    def get_cumulative_std_dev_precise(self) -> Optional[float]:
+        """Get the precise cumulative standard deviation (not rounded)"""
+        if self.cumulative_average is not None and self.raw_angles_count > 0:
+            mean_of_squares = self.cumulative_sum_of_squares / self.raw_angles_count
+            variance = mean_of_squares - (self.cumulative_average ** 2)
+            variance = max(0, variance)
+            return variance ** 0.5
+        return None
+    
+    def get_window_average(self, window_size: int) -> Optional[float]:
+        """
+        Calculate average of the last N filtered interpolated angle data points.
+        Uses the filtered_interpolated array for smoother results.
+        Only includes data from after the last statistics reset.
+        
+        Args:
+            window_size: Number of points to average (e.g., 120 for last 120 interpolated points)
+        
+        Returns:
+            Average of last window_size points, or None if not enough data (requires minimum 2 points)
+        """
+        # Only use data from after the last reset point
+        valid_data = self.interpolated_filtered[self.statistics_reset_index:]
+        
+        # Require at least 2 points for meaningful average
+        if len(valid_data) < 2:
+            return None
+        
+        if len(valid_data) < window_size:
+            # Use all available data if less than window size
+            window_size = len(valid_data)
+        
+        # Get last window_size points from valid data
+        last_angles = valid_data[-window_size:]
+        return sum(last_angles) / len(last_angles)
+    
+    def get_window_average_rounded(self, window_size: int) -> Optional[int]:
+        """Get window average rounded to integer"""
+        avg = self.get_window_average(window_size)
+        if avg is not None:
+            return round(avg)
+        return None
+    
+    def get_window_average_count(self, window_size: int) -> int:
+        """Get the actual number of elements used in window average calculation"""
+        # Only use data from after the last reset point
+        valid_data = self.interpolated_filtered[self.statistics_reset_index:]
+        
+        if len(valid_data) == 0:
+            return 0
+        
+        # Return the actual number of elements used (min of requested window_size and available data)
+        return min(len(valid_data), window_size)
+    
+    def get_window_std_dev(self, window_size: int) -> Optional[float]:
+        """Get the standard deviation of the last N filtered interpolated angle data points (rounded to 2 decimal places)"""
+        # Only use data from after the last reset point
+        valid_data = self.interpolated_filtered[self.statistics_reset_index:]
+        
+        # Require at least 2 points for meaningful std dev
+        if len(valid_data) < 2:
+            return None
+        
+        # Use actual window size (min of requested and available)
+        actual_window_size = min(len(valid_data), window_size)
+        window_data = valid_data[-actual_window_size:]
+        
+        # Calculate mean
+        mean = sum(window_data) / len(window_data)
+        
+        # Calculate variance
+        variance = sum((x - mean) ** 2 for x in window_data) / len(window_data)
+        
+        # Return standard deviation
+        std_dev = variance ** 0.5
+        return round(std_dev, 2)
+    
+    def get_window_std_dev_precise(self, window_size: int) -> Optional[float]:
+        """Get the precise standard deviation of the last N points (not rounded)"""
+        valid_data = self.interpolated_filtered[self.statistics_reset_index:]
+        
+        # Require at least 2 points for meaningful std dev
+        if len(valid_data) < 2:
+            return None
+        
+        actual_window_size = min(len(valid_data), window_size)
+        window_data = valid_data[-actual_window_size:]
+        
+        mean = sum(window_data) / len(window_data)
+        variance = sum((x - mean) ** 2 for x in window_data) / len(window_data)
+        return variance ** 0.5
+    
+    def clear_average_values(self):
+        """Clear only average values, marking current position as reset point"""
+        # Clear cumulative average tracking
+        self.cumulative_average = None
+        self.raw_angles_count = 0
+        self.batch_buffer.clear()
+        self.cumulative_sum_of_squares = 0.0
+        
+        # Mark the current position in interpolated data as reset point
+        # Window averages will only use frames from this index onwards
+        self.statistics_reset_index = len(self.interpolated_filtered)
+    
+    def clear_all_data(self):
+        """Clear all data including raw, smoothed, interpolated, and averages"""
+        self.timestamps.clear()
+        self.angles.clear()
+        self.angles_smoothed.clear()
+        self.confidences.clear()
+        self.interpolated_60fps.clear()
+        self.interpolated_filtered.clear()
+        self.cumulative_average = None
+        self.raw_angles_count = 0
+        self.batch_buffer.clear()
+        self.last_interpolated_index = 0
+        self.last_interpolated_timestamp = 0.0
+        self.filter.reset()
+        self.interpolated_filter.reset()
+
 # ============================================================================
 # JOINT CONFIGURATION
 # ============================================================================
@@ -473,6 +658,14 @@ CONFIDENCE_THRESHOLD = 40
 last_valid_trainer_angles: Dict[str, float] = {}  # {joint_name: last_valid_angle}
 last_valid_user_angles: Dict[str, float] = {}     # {joint_name: last_valid_angle}
 
+# Track pause state for statistics reset
+pause_flag = False  # True when video is paused, False when playing
+
+# Track exercise change gestures (Thumb_Up -> Thumb_Down within 3 seconds)
+thumbs_up_timestamp = None  # Timestamp of LAST (latest) Thumb_Up detected
+EXERCISE_CHANGE_WINDOW = 3.0  # seconds - window to detect Thumb_Down after Thumb_Up
+exercise_change_count = 0  # Counter for number of exercise changes
+
 # ============================================================================
 # DATA PROCESSING
 # ============================================================================
@@ -492,7 +685,8 @@ def process_batch(batch_data: Dict) -> Dict:
         'frames_processed': 0,
         'trainer_joints_found': set(),
         'user_joints_found': set(),
-        'sample_values': {}
+        'sample_values': {},
+        'exercise_change_detected': False
     }
     
     # Process each frame
@@ -500,9 +694,76 @@ def process_batch(batch_data: Dict) -> Dict:
         frame_timestamp = frame.get('t', datetime.now().timestamp()) / 1000.0  # Convert ms to seconds
         stats['frames_processed'] += 1
         
+        # === EXERCISE CHANGE DETECTION via Gesture Sequence ===
+        gesture = frame.get('gest')
+        
+        global thumbs_up_timestamp, exercise_change_count
+        
+        if gesture == "Thumb_Up":
+            # Store the LAST (latest) Thumb_Up timestamp
+            thumbs_up_timestamp = frame_timestamp
+            print(f"[GESTURE] Thumb_Up detected at {frame_timestamp}, waiting for Thumb_Down within 3 seconds")
+        
+        elif gesture == "Thumb_Down" and thumbs_up_timestamp is not None:
+            # Check if Thumb_Down is within 3 seconds of the last Thumb_Up
+            elapsed = frame_timestamp - thumbs_up_timestamp
+            
+            if elapsed <= EXERCISE_CHANGE_WINDOW:
+                # EXERCISE CHANGE DETECTED - Reset all statistics
+                print("\n" + "="*80)
+                print(f"🔄 EXERCISE CHANGE DETECTED!")
+                print(f"   Gesture Sequence: Thumb_Up → Thumb_Down ({elapsed:.2f}s)")
+                print(f"   Action: Resetting all statistics")
+                print(f"   New Exercise Session: #{exercise_change_count + 1}")
+                print("="*80 + "\n")
+                
+                for store in trainer_stores.values():
+                    store.clear_average_values()
+                for store in user_stores.values():
+                    store.clear_average_values()
+                
+                exercise_change_count += 1
+                thumbs_up_timestamp = None
+                stats['exercise_change_detected'] = True
+                stats['exercise_change_number'] = exercise_change_count
+            else:
+                # Thumb_Down came too late, reset waiting state
+                thumbs_up_timestamp = None
+        
+        # Check if Thumb_Up gesture sequence expired
+        if thumbs_up_timestamp is not None and (frame_timestamp - thumbs_up_timestamp) > EXERCISE_CHANGE_WINDOW:
+            thumbs_up_timestamp = None
+        
+        # Extract isPlaying from frame and detect pause state transitions
+        is_playing = frame.get('isPlaying', True)
+        
+        global pause_flag
+        
+        if not is_playing and not pause_flag:
+            # Video just paused - clear average values
+            pause_flag = True
+            print("[PAUSE] Video paused - clearing average values")
+            for store in trainer_stores.values():
+                store.clear_average_values()
+            for store in user_stores.values():
+                store.clear_average_values()
+            thumbs_up_timestamp = None  # Reset gesture state
+            stats['statistics_reset_at_frame'] = stats['frames_processed']
+        
+        elif is_playing and pause_flag:
+            # Video just resumed - clear average values IMMEDIATELY before processing this frame
+            pause_flag = False
+            print("[RESUME] Video resumed - clearing average values only")
+            for store in trainer_stores.values():
+                store.clear_average_values()
+            for store in user_stores.values():
+                store.clear_average_values()
+            thumbs_up_timestamp = None  # Reset gesture state
+            stats['statistics_reset_at_frame'] = stats['frames_processed']
+        
         # Process each joint key in the frame
         for key, value in frame.items():
-            if key == 't' or key == 'gest':  # Skip timestamp and gesture
+            if key in ('t', 'gest', 'isPlaying'):  # Skip timestamp, gesture, and isPlaying
                 continue
             
             # Determine if this is trainer or user data
@@ -594,6 +855,12 @@ def process_batch(batch_data: Dict) -> Dict:
     # Convert sets to lists for JSON serialization
     stats['trainer_joints_found'] = sorted(list(stats['trainer_joints_found']))
     stats['user_joints_found'] = sorted(list(stats['user_joints_found']))
+    
+    # Finalize batch: Update cumulative averages for all joints
+    for store in trainer_stores.values():
+        store.finalize_batch()
+    for store in user_stores.values():
+        store.finalize_batch()
     
     return stats
 
@@ -1056,6 +1323,515 @@ async def get_plot_data():
             for joint_name, store in user_stores.items()
         }
     }
+
+@app.get("/statistics")
+async def get_statistics():
+    """Get cumulative statistics (average & std dev) for all joints (calculated from raw data)"""
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "trainer_statistics": {
+            joint_name: {
+                "joint_name": joint_name,
+                "cumulative_average": store.get_cumulative_average(),
+                "cumulative_average_precise": store.get_cumulative_average_precise(),
+                "cumulative_std_dev": store.get_cumulative_std_dev(),
+                "cumulative_std_dev_precise": store.get_cumulative_std_dev_precise(),
+                "total_data_points": store.raw_angles_count
+            }
+            for joint_name, store in trainer_stores.items()
+        },
+        "user_statistics": {
+            joint_name: {
+                "joint_name": joint_name,
+                "cumulative_average": store.get_cumulative_average(),
+                "cumulative_average_precise": store.get_cumulative_average_precise(),
+                "cumulative_std_dev": store.get_cumulative_std_dev(),
+                "cumulative_std_dev_precise": store.get_cumulative_std_dev_precise(),
+                "total_data_points": store.raw_angles_count
+            }
+            for joint_name, store in user_stores.items()
+        }
+    }
+
+@app.get("/last-stats")
+async def get_last_stats(window_size: int = 120):
+    """
+    Get window statistics (average & std dev) for all joints (calculated from filtered interpolated data)
+    
+    Args:
+        window_size: Number of interpolated points to average (default: 120)
+    """
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "window_size": window_size,
+        "trainer_last_average": {
+            joint_name: {
+                "joint_name": joint_name,
+                "window_average": store.get_window_average_rounded(window_size),
+                "window_average_precise": store.get_window_average(window_size),
+                "window_std_dev": store.get_window_std_dev(window_size),
+                "window_std_dev_precise": store.get_window_std_dev_precise(window_size),
+                "elements_used": store.get_window_average_count(window_size),
+                "available_data_points": len(store.interpolated_filtered)
+            }
+            for joint_name, store in trainer_stores.items()
+        },
+        "user_last_average": {
+            joint_name: {
+                "joint_name": joint_name,
+                "window_average": store.get_window_average_rounded(window_size),
+                "window_average_precise": store.get_window_average(window_size),
+                "window_std_dev": store.get_window_std_dev(window_size),
+                "window_std_dev_precise": store.get_window_std_dev_precise(window_size),
+                "elements_used": store.get_window_average_count(window_size),
+                "available_data_points": len(store.interpolated_filtered)
+            }
+            for joint_name, store in user_stores.items()
+        }
+    }
+
+def calculate_primary_joints(stores_dict: dict) -> dict:
+    """
+    Calculate primary joints based on standard deviation analysis.
+    
+    Algorithm:
+    1. Get std dev for all joints (excluding Left Wrist and Right Wrist)
+    2. Sort by std dev in descending order
+    3. Calculate differences between consecutive std devs
+    4. Find the maximum difference
+    5. All joints above (before) that max difference are considered primary
+    
+    Returns:
+        dict with 'primary_joints' list and 'all_joints_sorted' list with details
+    """
+    # Joints to ignore in primary joint analysis
+    ignored_joints = {"Left Wrist", "Right Wrist"}
+    
+    # Collect std dev for all joints
+    joint_std_devs = []
+    for joint_name, store in stores_dict.items():
+        # Skip ignored joints
+        if joint_name in ignored_joints:
+            continue
+            
+        std_dev = store.get_cumulative_std_dev_precise()
+        if std_dev is not None:
+            joint_std_devs.append({
+                "joint_name": joint_name,
+                "std_dev": std_dev,
+                "cumulative_average": store.get_cumulative_average_precise(),
+                "data_points": store.raw_angles_count
+            })
+    
+    # Sort by std dev descending
+    joint_std_devs.sort(key=lambda x: x["std_dev"], reverse=True)
+    
+    # Calculate differences between consecutive std devs
+    differences = []
+    for i in range(len(joint_std_devs) - 1):
+        diff = joint_std_devs[i]["std_dev"] - joint_std_devs[i + 1]["std_dev"]
+        differences.append({
+            "index": i,
+            "diff": diff,
+            "from_joint": joint_std_devs[i]["joint_name"],
+            "to_joint": joint_std_devs[i + 1]["joint_name"],
+            "from_std_dev": joint_std_devs[i]["std_dev"],
+            "to_std_dev": joint_std_devs[i + 1]["std_dev"]
+        })
+    
+    # Find maximum difference
+    primary_joints = []
+    max_diff_info = None
+    
+    if differences:
+        max_diff_info = max(differences, key=lambda x: x["diff"])
+        cutoff_index = max_diff_info["index"]
+        
+        # All joints up to and including the cutoff_index are primary
+        primary_joints = [joint["joint_name"] for joint in joint_std_devs[:cutoff_index + 1]]
+    
+    return {
+        "primary_joints": primary_joints,
+        "primary_count": len(primary_joints),
+        "total_joints": len(joint_std_devs),
+        "all_joints_sorted": joint_std_devs,
+        "max_difference": max_diff_info,
+        "all_differences": differences
+    }
+
+@app.get("/primary-joints")
+async def get_primary_joints():
+    """
+    Analyze and return primary joints for both trainer and user based on standard deviation.
+    Primary joints are those with significantly higher std dev (indicating actual movement).
+    """
+    trainer_analysis = calculate_primary_joints(trainer_stores)
+    user_analysis = calculate_primary_joints(user_stores)
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "trainer": trainer_analysis,
+        "user": user_analysis,
+        "summary": {
+            "trainer_primary_count": trainer_analysis["primary_count"],
+            "trainer_total_joints": trainer_analysis["total_joints"],
+            "user_primary_count": user_analysis["primary_count"],
+            "user_total_joints": user_analysis["total_joints"]
+        }
+    }
+
+@app.get("/exercise-info")
+async def get_exercise_info():
+    """Get current exercise change tracking information"""
+    import time
+    
+    time_remaining = None
+    if thumbs_up_timestamp is not None:
+        current_time = time.time()
+        elapsed = current_time - thumbs_up_timestamp
+        if elapsed <= EXERCISE_CHANGE_WINDOW:
+            time_remaining = EXERCISE_CHANGE_WINDOW - elapsed
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "exercise_change_count": exercise_change_count,
+        "thumbs_up_waiting": thumbs_up_timestamp is not None,
+        "time_remaining": round(time_remaining, 2) if time_remaining is not None else None,
+        "exercise_change_window": EXERCISE_CHANGE_WINDOW
+    }
+
+@app.get("/live-primary-joints", response_class=HTMLResponse)
+async def get_live_primary_joints():
+    """HTML page showing live primary joints analysis with auto-refresh"""
+    
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Live Primary Joints Analysis</title>
+    </head>
+    <body>
+        <h1>Live Primary Joints Analysis</h1>
+        <p id="updateStatus">Loading...</p>
+        
+        <h2>Trainer Primary Joints</h2>
+        <p id="trainerSummary">Loading...</p>
+        <table id="trainerTable" border="1">
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Joint Name</th>
+                    <th>Std Dev</th>
+                    <th>Cumulative Avg</th>
+                    <th>Data Points</th>
+                    <th>Is Primary</th>
+                </tr>
+            </thead>
+            <tbody id="trainerBody">
+                <tr><td colspan="6">Loading...</td></tr>
+            </tbody>
+        </table>
+        
+        <h2>User Primary Joints</h2>
+        <p id="userSummary">Loading...</p>
+        <table id="userTable" border="1">
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Joint Name</th>
+                    <th>Std Dev</th>
+                    <th>Cumulative Avg</th>
+                    <th>Data Points</th>
+                    <th>Is Primary</th>
+                </tr>
+            </thead>
+            <tbody id="userBody">
+                <tr><td colspan="6">Loading...</td></tr>
+            </tbody>
+        </table>
+        
+        <h2>Max Difference Analysis</h2>
+        <h3>Trainer</h3>
+        <table id="trainerMaxDiff" border="1">
+            <thead>
+                <tr>
+                    <th>From Joint</th>
+                    <th>From Std Dev</th>
+                    <th>To Joint</th>
+                    <th>To Std Dev</th>
+                    <th>Difference</th>
+                </tr>
+            </thead>
+            <tbody id="trainerMaxDiffBody">
+                <tr><td colspan="5">Loading...</td></tr>
+            </tbody>
+        </table>
+        
+        <h3>User</h3>
+        <table id="userMaxDiff" border="1">
+            <thead>
+                <tr>
+                    <th>From Joint</th>
+                    <th>From Std Dev</th>
+                    <th>To Joint</th>
+                    <th>To Std Dev</th>
+                    <th>Difference</th>
+                </tr>
+            </thead>
+            <tbody id="userMaxDiffBody">
+                <tr><td colspan="5">Loading...</td></tr>
+            </tbody>
+        </table>
+
+        <script>
+            let updateCount = 0;
+            
+            function formatValue(val) {
+                if (val === null || val === undefined) return '—';
+                if (typeof val === 'number') return val.toFixed(2);
+                return val;
+            }
+            
+            async function updatePrimaryJoints() {
+                try {
+                    const response = await fetch('/primary-joints');
+                    const data = await response.json();
+                    
+                    // Update trainer summary
+                    document.getElementById('trainerSummary').textContent = 
+                        `Primary Joints: ${data.trainer.primary_count} / ${data.trainer.total_joints}`;
+                    
+                    // Update user summary
+                    document.getElementById('userSummary').textContent = 
+                        `Primary Joints: ${data.user.primary_count} / ${data.user.total_joints}`;
+                    
+                    // Update trainer table
+                    let trainerHtml = '';
+                    data.trainer.all_joints_sorted.forEach((joint, index) => {
+                        const isPrimary = data.trainer.primary_joints.includes(joint.joint_name);
+                        trainerHtml += `
+                            <tr>
+                                <td>${index + 1}</td>
+                                <td>${joint.joint_name}</td>
+                                <td>${formatValue(joint.std_dev)}</td>
+                                <td>${formatValue(joint.cumulative_average)}</td>
+                                <td>${joint.data_points}</td>
+                                <td>${isPrimary ? '✓ PRIMARY' : ''}</td>
+                            </tr>
+                        `;
+                    });
+                    document.getElementById('trainerBody').innerHTML = trainerHtml;
+                    
+                    // Update user table
+                    let userHtml = '';
+                    data.user.all_joints_sorted.forEach((joint, index) => {
+                        const isPrimary = data.user.primary_joints.includes(joint.joint_name);
+                        userHtml += `
+                            <tr>
+                                <td>${index + 1}</td>
+                                <td>${joint.joint_name}</td>
+                                <td>${formatValue(joint.std_dev)}</td>
+                                <td>${formatValue(joint.cumulative_average)}</td>
+                                <td>${joint.data_points}</td>
+                                <td>${isPrimary ? '✓ PRIMARY' : ''}</td>
+                            </tr>
+                        `;
+                    });
+                    document.getElementById('userBody').innerHTML = userHtml;
+                    
+                    // Update trainer max difference
+                    if (data.trainer.max_difference) {
+                        const md = data.trainer.max_difference;
+                        document.getElementById('trainerMaxDiffBody').innerHTML = `
+                            <tr>
+                                <td>${md.from_joint}</td>
+                                <td>${formatValue(md.from_std_dev)}</td>
+                                <td>${md.to_joint}</td>
+                                <td>${formatValue(md.to_std_dev)}</td>
+                                <td>${formatValue(md.diff)}</td>
+                            </tr>
+                        `;
+                    } else {
+                        document.getElementById('trainerMaxDiffBody').innerHTML = 
+                            '<tr><td colspan="5">No difference data</td></tr>';
+                    }
+                    
+                    // Update user max difference
+                    if (data.user.max_difference) {
+                        const md = data.user.max_difference;
+                        document.getElementById('userMaxDiffBody').innerHTML = `
+                            <tr>
+                                <td>${md.from_joint}</td>
+                                <td>${formatValue(md.from_std_dev)}</td>
+                                <td>${md.to_joint}</td>
+                                <td>${formatValue(md.to_std_dev)}</td>
+                                <td>${formatValue(md.diff)}</td>
+                            </tr>
+                        `;
+                    } else {
+                        document.getElementById('userMaxDiffBody').innerHTML = 
+                            '<tr><td colspan="5">No difference data</td></tr>';
+                    }
+                    
+                    updateCount++;
+                    document.getElementById('updateStatus').textContent = 
+                        `Last updated: ${new Date().toLocaleTimeString()} (Update #${updateCount})`;
+                    
+                } catch (error) {
+                    document.getElementById('updateStatus').textContent = 
+                        `Error: ${error.message}`;
+                }
+            }
+            
+            // Initial update
+            updatePrimaryJoints();
+            
+            // Update every 1 second
+            setInterval(updatePrimaryJoints, 1000);
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content)
+
+@app.get("/live-statistics", response_class=HTMLResponse)
+async def get_live_statistics(window_size: int = 120):
+    """HTML page showing live statistics table that updates every 500ms"""
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Live Statistics - Posture Analysis</title>
+    </head>
+    <body>
+        <h1>Live Statistics Monitor</h1>
+        <p>Window Size: {window_size} frames | Auto-refresh: 500ms</p>
+        <p id="updateStatus">Connecting...</p>
+        
+        <table id="statsTable" border="1">
+            <thead>
+                <tr>
+                    <th>Joint Name</th>
+                    <th>Role</th>
+                    <th>Cumulative Avg</th>
+                    <th>Cumulative Std Dev</th>
+                    <th>Window Avg (Last {window_size})</th>
+                    <th>Window Std Dev</th>
+                    <th>Data Points (Total/Window)</th>
+                </tr>
+            </thead>
+            <tbody id="statsBody">
+                <tr><td colspan="7">Loading data...</td></tr>
+            </tbody>
+        </table>
+
+        <script>
+            const WINDOW_SIZE = {window_size};
+            let updateCount = 0;
+            
+            function formatValue(value, decimals = 1) {{
+                if (value === null || value === undefined) {{
+                    return '—';
+                }}
+                return value.toFixed(decimals);
+            }}
+            
+            function formatValueWithPrecise(value, preciseValue) {{
+                if (value === null || value === undefined) {{
+                    return '—';
+                }}
+                let text = value;
+                if (preciseValue !== null && preciseValue !== undefined) {{
+                    text += ` (${{preciseValue.toFixed(4)}})`;
+                }}
+                return text;
+            }}
+            
+            async function updateStatistics() {{
+                try {{
+                    // Fetch both endpoints in parallel
+                    const [cumulativeRes, windowRes] = await Promise.all([
+                        fetch('/statistics'),
+                        fetch(`/last-stats?window_size=${{WINDOW_SIZE}}`)
+                    ]);
+                    
+                    const cumulativeData = await cumulativeRes.json();
+                    const windowData = await windowRes.json();
+                    
+                    // Build table rows
+                    let html = '';
+                    
+                    // Process trainer data
+                    const trainerStats = cumulativeData.trainer_statistics;
+                    const trainerWindow = windowData.trainer_last_average;
+                    
+                    Object.keys(trainerStats).forEach(jointName => {{
+                        const cumStats = trainerStats[jointName];
+                        const winStats = trainerWindow[jointName];
+                        
+                        html += `
+                            <tr>
+                                <td>${{jointName}}</td>
+                                <td>TRAINER</td>
+                                <td>${{formatValueWithPrecise(cumStats.cumulative_average, cumStats.cumulative_average_precise)}}</td>
+                                <td>${{formatValueWithPrecise(cumStats.cumulative_std_dev, cumStats.cumulative_std_dev_precise)}}</td>
+                                <td>${{formatValueWithPrecise(winStats.window_average, winStats.window_average_precise)}}</td>
+                                <td>${{formatValueWithPrecise(winStats.window_std_dev, winStats.window_std_dev_precise)}}</td>
+                                <td>${{cumStats.total_data_points}} / ${{winStats.elements_used}}</td>
+                            </tr>
+                        `;
+                    }});
+                    
+                    // Process user data
+                    const userStats = cumulativeData.user_statistics;
+                    const userWindow = windowData.user_last_average;
+                    
+                    Object.keys(userStats).forEach(jointName => {{
+                        const cumStats = userStats[jointName];
+                        const winStats = userWindow[jointName];
+                        
+                        html += `
+                            <tr>
+                                <td>${{jointName}}</td>
+                                <td>USER</td>
+                                <td>${{formatValueWithPrecise(cumStats.cumulative_average, cumStats.cumulative_average_precise)}}</td>
+                                <td>${{formatValueWithPrecise(cumStats.cumulative_std_dev, cumStats.cumulative_std_dev_precise)}}</td>
+                                <td>${{formatValueWithPrecise(winStats.window_average, winStats.window_average_precise)}}</td>
+                                <td>${{formatValueWithPrecise(winStats.window_std_dev, winStats.window_std_dev_precise)}}</td>
+                                <td>${{cumStats.total_data_points}} / ${{winStats.elements_used}}</td>
+                            </tr>
+                        `;
+                    }});
+                    
+                    document.getElementById('statsBody').innerHTML = html;
+                    
+                    updateCount++;
+                    document.getElementById('updateStatus').textContent = 
+                        `Live | Updates: ${{updateCount}} | Last: ${{new Date().toLocaleTimeString()}}`;
+                    
+                }} catch (error) {{
+                    console.error('Error fetching statistics:', error);
+                    document.getElementById('updateStatus').textContent = 'Connection Error';
+                }}
+            }}
+            
+            // Initial update
+            updateStatistics();
+            
+            // Update every 500ms
+            setInterval(updateStatistics, 500);
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content)
 
 @app.get("/interpolated-plot", response_class=HTMLResponse)
 async def get_interpolated_plot_page():

@@ -124,7 +124,8 @@ function Workout() {
       userAngles,
       currentGesture,
       gestureConfidence,
-      currentTimestampRef.current
+      currentTimestampRef.current,
+      isPlaying
     );
     setCombinedData(snapshot);
     
