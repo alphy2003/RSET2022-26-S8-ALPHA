@@ -18,7 +18,30 @@ export const WebSocketProvider = ({ children }) => {
 
     ws.current.onmessage = (event) => {
       console.log('Message received:', event.data);
-      setMessages(prev => [...prev, { text: event.data, type: 'received' }]);
+      
+      // Try to parse as JSON to check for feedback messages
+      try {
+        const parsed = JSON.parse(event.data);
+        
+        // Handle feedback message - display only the message text
+        if (parsed.type === 'feedback') {
+          console.log('[FEEDBACK] Received feedback message:', parsed.message);
+          setMessages(prev => [...prev, { text: parsed.message, type: 'received' }]);
+          return;
+        }
+        
+        // Handle feedback clear command - reset all messages
+        if (parsed.type === 'feedback_clear') {
+          console.log('[FEEDBACK] Clearing all messages');
+          setMessages([]);
+          return;
+        }
+        
+        // Ignore all other JSON messages (e.g. error acks, data_updated pings)
+        
+      } catch (error) {
+        // Not JSON — ignore silently
+      }
     };
 
     ws.current.onerror = (error) => {
@@ -41,7 +64,7 @@ export const WebSocketProvider = ({ children }) => {
   const sendMessage = (message) => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       ws.current.send(message);
-      setMessages(prev => [...prev, { text: message, type: 'sent' }]);
+      // Do not store outgoing frame batches in messages state
     } else {
       console.error('WebSocket is not connected');
     }

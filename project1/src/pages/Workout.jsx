@@ -218,8 +218,8 @@ function Workout() {
       {combinedData && (
         <div style={{
           position: 'fixed',
-          bottom: '20px',
-          right: '20px',
+          top: '20px',
+          left: '20px',
           background: 'rgba(0,0,0,0.9)',
           color: '#10b981',
           padding: '15px',
