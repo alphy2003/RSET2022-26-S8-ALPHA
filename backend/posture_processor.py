@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
 import numpy as np
 from scipy import interpolate
@@ -276,6 +277,11 @@ class JointDataStore:
         # Cumulative standard deviation tracking
         self.cumulative_sum_of_squares: float = 0.0     # Running sum of squared values for std dev calculation
         
+        # Cumulative stats for interpolated_filtered data (from statistics_reset_index onward)
+        self.interp_cumulative_average: Optional[float] = None  # Running mean of interpolated_filtered values
+        self.interp_count: int = 0                              # Count of interpolated_filtered values tracked
+        self.interp_sum_of_squares: float = 0.0                # Running sum of x² for interpolated_filtered
+        
         # Create incremental filter instance (maintains state, no reprocessing)
         self.filter = create_incremental_filter(
             SMOOTHING_CONFIG['filter_type'],
@@ -360,7 +366,12 @@ class JointDataStore:
                 self.interpolated_60fps.append(value)
                 # Apply filter to interpolated value and round to integer
                 filtered_value = self.interpolated_filter.update(value)
-                self.interpolated_filtered.append(round(filtered_value))
+                # Clamp to [0, 180] range
+                clamped_value = max(0, min(180, round(filtered_value)))
+                self.interpolated_filtered.append(clamped_value)
+                # Update cumulative interp stats if at or after reset index
+                if len(self.interpolated_filtered) - 1 >= self.statistics_reset_index:
+                    self._update_interp_cumulative_stats(clamped_value)
             
             self.last_interpolated_index = current_data_count - 1
             self.last_interpolated_timestamp = interpolated_timestamps[-1]
@@ -420,7 +431,12 @@ class JointDataStore:
             self.interpolated_60fps.append(value)
             # Apply filter to interpolated value and round to integer
             filtered_value = self.interpolated_filter.update(value)
-            self.interpolated_filtered.append(round(filtered_value))
+            # Clamp to [0, 180] range
+            clamped_value = max(0, min(180, round(filtered_value)))
+            self.interpolated_filtered.append(clamped_value)
+            # Update cumulative interp stats if at or after reset index
+            if len(self.interpolated_filtered) - 1 >= self.statistics_reset_index:
+                self._update_interp_cumulative_stats(clamped_value)
         
         self.last_interpolated_index = current_data_count - 1
         self.last_interpolated_timestamp = new_interpolated_timestamps[-1]
@@ -484,6 +500,42 @@ class JointDataStore:
             mean_of_squares = self.cumulative_sum_of_squares / self.raw_angles_count
             variance = mean_of_squares - (self.cumulative_average ** 2)
             variance = max(0, variance)
+            return variance ** 0.5
+        return None
+    
+    def _update_interp_cumulative_stats(self, value: float):
+        """Incrementally update cumulative stats for interpolated_filtered data (O(1))"""
+        self.interp_sum_of_squares += value * value
+        self.interp_count += 1
+        if self.interp_cumulative_average is None:
+            self.interp_cumulative_average = float(value)
+        else:
+            # Welford-style incremental mean update
+            self.interp_cumulative_average += (value - self.interp_cumulative_average) / self.interp_count
+    
+    def get_interp_cumulative_average(self) -> Optional[float]:
+        """Get cumulative average of interpolated_filtered values (rounded to integer)"""
+        if self.interp_cumulative_average is not None:
+            return round(self.interp_cumulative_average)
+        return None
+    
+    def get_interp_cumulative_average_precise(self) -> Optional[float]:
+        """Get precise cumulative average of interpolated_filtered values (not rounded)"""
+        return self.interp_cumulative_average
+    
+    def get_interp_cumulative_std_dev(self) -> Optional[float]:
+        """Get cumulative std dev of interpolated_filtered values (rounded to 2 decimal places)"""
+        if self.interp_cumulative_average is not None and self.interp_count > 0:
+            mean_of_squares = self.interp_sum_of_squares / self.interp_count
+            variance = max(0, mean_of_squares - (self.interp_cumulative_average ** 2))
+            return round(variance ** 0.5, 2)
+        return None
+    
+    def get_interp_cumulative_std_dev_precise(self) -> Optional[float]:
+        """Get precise cumulative std dev of interpolated_filtered values (not rounded)"""
+        if self.interp_cumulative_average is not None and self.interp_count > 0:
+            mean_of_squares = self.interp_sum_of_squares / self.interp_count
+            variance = max(0, mean_of_squares - (self.interp_cumulative_average ** 2))
             return variance ** 0.5
         return None
     
@@ -578,8 +630,24 @@ class JointDataStore:
         self.batch_buffer.clear()
         self.cumulative_sum_of_squares = 0.0
         
+        # Clear cumulative interpolated_filtered stats
+        self.interp_cumulative_average = None
+        self.interp_count = 0
+        self.interp_sum_of_squares = 0.0
+        
         # Mark the current position in interpolated data as reset point
         # Window averages will only use frames from this index onwards
+        self.statistics_reset_index = len(self.interpolated_filtered)
+    
+    def clear_interpolated_cumulative_stats(self):
+        """Clear only the cumulative statistics for interpolated_filtered data"""
+        # Clear cumulative interpolated_filtered stats only
+        self.interp_cumulative_average = None
+        self.interp_count = 0
+        self.interp_sum_of_squares = 0.0
+        
+        # Mark the current position in interpolated data as reset point
+        # This affects window-based calculations that use interpolated_filtered data
         self.statistics_reset_index = len(self.interpolated_filtered)
     
     def clear_all_data(self):
@@ -593,6 +661,11 @@ class JointDataStore:
         self.cumulative_average = None
         self.raw_angles_count = 0
         self.batch_buffer.clear()
+        self.cumulative_sum_of_squares = 0.0
+        self.interp_cumulative_average = None
+        self.interp_count = 0
+        self.interp_sum_of_squares = 0.0
+        self.statistics_reset_index = 0
         self.last_interpolated_index = 0
         self.last_interpolated_timestamp = 0.0
         self.filter.reset()
@@ -761,6 +834,10 @@ def process_batch(batch_data: Dict) -> Dict:
             thumbs_up_timestamp = None  # Reset gesture state
             stats['statistics_reset_at_frame'] = stats['frames_processed']
         
+        # Skip joint data processing entirely while video is paused
+        if not is_playing:
+            continue
+
         # Process each joint key in the frame
         for key, value in frame.items():
             if key in ('t', 'gest', 'isPlaying'):  # Skip timestamp, gesture, and isPlaying
@@ -866,6 +943,68 @@ def process_batch(batch_data: Dict) -> Dict:
 
 
 # ============================================================================
+# FEEDBACK MANAGER
+# ============================================================================
+
+class FeedbackManager:
+    """
+    Manages feedback messages for the frontend.
+    Sends text messages via WebSocket.
+    """
+    
+    def __init__(self):
+        self.websocket = None
+        
+    def set_websocket(self, websocket):
+        """Set the active WebSocket connection for sending messages"""
+        self.websocket = websocket
+        
+    def clear_websocket(self):
+        """Clear the WebSocket connection when client disconnects"""
+        self.websocket = None
+        
+    async def clear_frontend_message_section(self):
+        """
+        Send command to clear all feedback messages on the frontend
+        """
+        if self.websocket:
+            try:
+                await self.websocket.send_json({
+                    "type": "feedback_clear",
+                    "message": "clear_all"
+                })
+                print("[FEEDBACK] Cleared frontend message section")
+            except Exception as e:
+                print(f"[FEEDBACK ERROR] Failed to clear messages: {e}")
+    
+    async def send_message(self, message: str):
+        """
+        Send a text message to the frontend
+        
+        Args:
+            message: Text message to send
+        """
+        if not self.websocket:
+            print("[FEEDBACK] No active WebSocket connection")
+            return
+            
+        try:
+            await self.websocket.send_json({
+                "type": "feedback",
+                "message": message,
+                "timestamp": datetime.now().isoformat()
+            })
+            print(f"[FEEDBACK] Sent message: {message[:50]}...")
+            
+        except Exception as e:
+            print(f"[FEEDBACK ERROR] Failed to send message: {e}")
+
+
+# Global feedback manager instance
+feedback_manager = FeedbackManager()
+
+
+# ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
 
@@ -902,6 +1041,9 @@ async def websocket_endpoint(websocket: WebSocket):
     print("\n[WEBSOCKET] Client connected to /ws")
     print("[WEBSOCKET] Waiting for data...")
     
+    # Set the websocket for feedback manager
+    feedback_manager.set_websocket(websocket)
+    
     try:
         while True:
             # Receive data from client
@@ -934,10 +1076,12 @@ async def websocket_endpoint(websocket: WebSocket):
     
     except WebSocketDisconnect:
         print("[WEBSOCKET] Client disconnected")
+        feedback_manager.clear_websocket()
     except Exception as e:
         print(f"[WEBSOCKET ERROR] {e}")
         import traceback
         traceback.print_exc()
+        feedback_manager.clear_websocket()
 
 @app.get("/")
 async def root():
@@ -1459,6 +1603,61 @@ def calculate_primary_joints(stores_dict: dict) -> dict:
         "all_differences": differences
     }
 
+def calculate_primary_joints_interpolated(stores_dict: dict) -> dict:
+    """
+    Calculate primary joints based on cumulative standard deviation of
+    interpolated_filtered data (60 FPS, Kalman+Gaussian smoothed).
+    
+    Identical algorithm to calculate_primary_joints but driven by
+    interp_cumulative_std_dev instead of raw-angle cumulative_std_dev.
+    """
+    ignored_joints = {"Left Wrist", "Right Wrist"}
+    
+    joint_std_devs = []
+    for joint_name, store in stores_dict.items():
+        if joint_name in ignored_joints:
+            continue
+        
+        std_dev = store.get_interp_cumulative_std_dev_precise()
+        if std_dev is not None:
+            joint_std_devs.append({
+                "joint_name": joint_name,
+                "std_dev": std_dev,
+                "cumulative_average": store.get_interp_cumulative_average_precise(),
+                "data_points": store.interp_count
+            })
+    
+    joint_std_devs.sort(key=lambda x: x["std_dev"], reverse=True)
+    
+    differences = []
+    for i in range(len(joint_std_devs) - 1):
+        diff = joint_std_devs[i]["std_dev"] - joint_std_devs[i + 1]["std_dev"]
+        differences.append({
+            "index": i,
+            "diff": diff,
+            "from_joint": joint_std_devs[i]["joint_name"],
+            "to_joint": joint_std_devs[i + 1]["joint_name"],
+            "from_std_dev": joint_std_devs[i]["std_dev"],
+            "to_std_dev": joint_std_devs[i + 1]["std_dev"]
+        })
+    
+    primary_joints = []
+    max_diff_info = None
+    
+    if differences:
+        max_diff_info = max(differences, key=lambda x: x["diff"])
+        cutoff_index = max_diff_info["index"]
+        primary_joints = [joint["joint_name"] for joint in joint_std_devs[:cutoff_index + 1]]
+    
+    return {
+        "primary_joints": primary_joints,
+        "primary_count": len(primary_joints),
+        "total_joints": len(joint_std_devs),
+        "all_joints_sorted": joint_std_devs,
+        "max_difference": max_diff_info,
+        "all_differences": differences
+    }
+
 @app.get("/primary-joints")
 async def get_primary_joints():
     """
@@ -1467,6 +1666,27 @@ async def get_primary_joints():
     """
     trainer_analysis = calculate_primary_joints(trainer_stores)
     user_analysis = calculate_primary_joints(user_stores)
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "trainer": trainer_analysis,
+        "user": user_analysis,
+        "summary": {
+            "trainer_primary_count": trainer_analysis["primary_count"],
+            "trainer_total_joints": trainer_analysis["total_joints"],
+            "user_primary_count": user_analysis["primary_count"],
+            "user_total_joints": user_analysis["total_joints"]
+        }
+    }
+
+@app.get("/primary-joints-interpolated")
+async def get_primary_joints_interpolated():
+    """
+    Analyze and return primary joints for both trainer and user based on the
+    cumulative standard deviation of interpolated_filtered (60 FPS smoothed) data.
+    """
+    trainer_analysis = calculate_primary_joints_interpolated(trainer_stores)
+    user_analysis = calculate_primary_joints_interpolated(user_stores)
     
     return {
         "timestamp": datetime.now().isoformat(),
@@ -1498,6 +1718,81 @@ async def get_exercise_info():
         "thumbs_up_waiting": thumbs_up_timestamp is not None,
         "time_remaining": round(time_remaining, 2) if time_remaining is not None else None,
         "exercise_change_window": EXERCISE_CHANGE_WINDOW
+    }
+
+@app.api_route("/clear-all", methods=["GET", "POST"])
+async def clear_all_data_endpoint():
+    """
+    Clear ALL data (raw angles, smoothed, interpolated, cumulative stats, filters)
+    for every trainer and user joint store. Use this for a full reset between sessions.
+    """
+    global thumbs_up_timestamp, exercise_change_count
+    global last_valid_trainer_angles, last_valid_user_angles
+    for store in trainer_stores.values():
+        store.clear_all_data()
+    for store in user_stores.values():
+        store.clear_all_data()
+    # Clear confidence-fallback caches so no stale angles re-seed the stores
+    last_valid_trainer_angles.clear()
+    last_valid_user_angles.clear()
+    thumbs_up_timestamp = None
+    exercise_change_count = 0
+    # Do NOT reset pause_flag — leave the state machine intact.
+    # Resetting to False while paused would allow a mixed-isPlaying batch
+    # to slip through the `if not is_playing: continue` guard on the same cycle.
+    return {
+        "status": "success",
+        "message": "All joint data cleared",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.api_route("/clear-stats", methods=["GET", "POST"])
+async def clear_stats_endpoint():
+    """
+    Clear only cumulative statistics (raw + interpolated averages and std devs)
+    for every trainer and user joint store, without discarding the underlying
+    angle or interpolated data. Marks the current interpolated position as the
+    new reset point so window averages also start fresh from here.
+    """
+    for store in trainer_stores.values():
+        store.clear_average_values()
+    for store in user_stores.values():
+        store.clear_average_values()
+    return {
+        "status": "success",
+        "message": "Cumulative statistics cleared",
+        "timestamp": datetime.now().isoformat()
+    }
+
+class FeedbackMessage(BaseModel):
+    """Request model for sending feedback messages"""
+    message: str
+
+@app.post("/send")
+async def send_feedback_message(feedback: FeedbackMessage):
+    """
+    Send a feedback message to the connected frontend client
+    
+    Request body:
+        {"message": "Your feedback text here"}
+    """
+    await feedback_manager.send_message(feedback.message)
+    return {
+        "status": "success",
+        "message": "Feedback sent",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/clear")
+async def clear_feedback_messages():
+    """
+    Clear all feedback messages on the frontend
+    """
+    await feedback_manager.clear_frontend_message_section()
+    return {
+        "status": "success",
+        "message": "Feedback messages cleared",
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/live-primary-joints", response_class=HTMLResponse)
