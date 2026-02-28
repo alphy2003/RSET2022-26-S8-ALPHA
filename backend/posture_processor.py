@@ -739,6 +739,11 @@ thumbs_up_timestamp = None  # Timestamp of LAST (latest) Thumb_Up detected
 EXERCISE_CHANGE_WINDOW = 3.0  # seconds - window to detect Thumb_Down after Thumb_Up
 exercise_change_count = 0  # Counter for number of exercise changes
 
+# Feedback algorithm state
+feedback_batch_count = 0    # increments each batch; resets on exercise change, pause, or after feedback sent
+feedback_check_flag = False # True after first mismatch; cleared on positive feedback or exercise change
+feedback_complete = False   # True after positive feedback; stops all checking until exercise change
+
 # ============================================================================
 # DATA PROCESSING
 # ============================================================================
@@ -770,7 +775,7 @@ def process_batch(batch_data: Dict) -> Dict:
         # === EXERCISE CHANGE DETECTION via Gesture Sequence ===
         gesture = frame.get('gest')
         
-        global thumbs_up_timestamp, exercise_change_count
+        global thumbs_up_timestamp, exercise_change_count, feedback_batch_count, feedback_check_flag, feedback_complete
         
         if gesture == "Thumb_Up":
             # Store the LAST (latest) Thumb_Up timestamp
@@ -799,6 +804,7 @@ def process_batch(batch_data: Dict) -> Dict:
                 thumbs_up_timestamp = None
                 stats['exercise_change_detected'] = True
                 stats['exercise_change_number'] = exercise_change_count
+                _reset_feedback_state()
             else:
                 # Thumb_Down came too late, reset waiting state
                 thumbs_up_timestamp = None
@@ -821,6 +827,7 @@ def process_batch(batch_data: Dict) -> Dict:
             for store in user_stores.values():
                 store.clear_average_values()
             thumbs_up_timestamp = None  # Reset gesture state
+            _reset_feedback_state()
             stats['statistics_reset_at_frame'] = stats['frames_processed']
         
         elif is_playing and pause_flag:
@@ -832,6 +839,7 @@ def process_batch(batch_data: Dict) -> Dict:
             for store in user_stores.values():
                 store.clear_average_values()
             thumbs_up_timestamp = None  # Reset gesture state
+            _reset_feedback_state()
             stats['statistics_reset_at_frame'] = stats['frames_processed']
         
         # Skip joint data processing entirely while video is paused
@@ -1055,7 +1063,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Process the batch and get statistics
                 stats = process_batch(batch_data)
-                      
+
+                # Run primary-angle feedback check (only while video is playing)
+                if not pause_flag:
+                    await run_feedback_check()
+
                 # Broadcast update to all connected plot viewers
                 await broadcast_update()
                 
@@ -1549,7 +1561,7 @@ def calculate_primary_joints(stores_dict: dict) -> dict:
         dict with 'primary_joints' list and 'all_joints_sorted' list with details
     """
     # Joints to ignore in primary joint analysis
-    ignored_joints = {"Left Wrist", "Right Wrist"}
+    ignored_joints = {"Left Wrist", "Right Wrist", "Neck"}
     
     # Collect std dev for all joints
     joint_std_devs = []
@@ -1569,7 +1581,19 @@ def calculate_primary_joints(stores_dict: dict) -> dict:
     
     # Sort by std dev descending
     joint_std_devs.sort(key=lambda x: x["std_dev"], reverse=True)
-    
+
+    # If the highest std dev is below threshold, no meaningful movement detected
+    MIN_STD_DEV = 5.0
+    if not joint_std_devs or joint_std_devs[0]["std_dev"] < MIN_STD_DEV:
+        return {
+            "primary_joints": [],
+            "primary_count": 0,
+            "total_joints": len(joint_std_devs),
+            "all_joints_sorted": joint_std_devs,
+            "max_difference": None,
+            "all_differences": []
+        }
+
     # Calculate differences between consecutive std devs
     differences = []
     for i in range(len(joint_std_devs) - 1):
@@ -1611,7 +1635,7 @@ def calculate_primary_joints_interpolated(stores_dict: dict) -> dict:
     Identical algorithm to calculate_primary_joints but driven by
     interp_cumulative_std_dev instead of raw-angle cumulative_std_dev.
     """
-    ignored_joints = {"Left Wrist", "Right Wrist"}
+    ignored_joints = {"Left Wrist", "Right Wrist", "Neck"}
     
     joint_std_devs = []
     for joint_name, store in stores_dict.items():
@@ -1628,7 +1652,19 @@ def calculate_primary_joints_interpolated(stores_dict: dict) -> dict:
             })
     
     joint_std_devs.sort(key=lambda x: x["std_dev"], reverse=True)
-    
+
+    # If the highest std dev is below threshold, no meaningful movement detected
+    MIN_STD_DEV = 5.0
+    if not joint_std_devs or joint_std_devs[0]["std_dev"] < MIN_STD_DEV:
+        return {
+            "primary_joints": [],
+            "primary_count": 0,
+            "total_joints": len(joint_std_devs),
+            "all_joints_sorted": joint_std_devs,
+            "max_difference": None,
+            "all_differences": []
+        }
+
     differences = []
     for i in range(len(joint_std_devs) - 1):
         diff = joint_std_devs[i]["std_dev"] - joint_std_devs[i + 1]["std_dev"]
@@ -1657,6 +1693,187 @@ def calculate_primary_joints_interpolated(stores_dict: dict) -> dict:
         "max_difference": max_diff_info,
         "all_differences": differences
     }
+
+
+# ============================================================================
+# FEEDBACK ALGORITHM
+# ============================================================================
+
+def checkprimaryangles() -> dict:
+    """
+    Compare trainer primary joints (raw cumulative) vs user primary joints
+    (interpolated cumulative).
+
+    Returns:
+        {
+            'is_same': 1 (match) or 0 (mismatch),
+            'feedback': str,
+            'trainer_primary': List[str],
+            'user_primary':    List[str]
+        }
+    """
+    trainer_result = calculate_primary_joints(trainer_stores)
+    user_result    = calculate_primary_joints_interpolated(user_stores)
+
+    trainer_primary = trainer_result["primary_joints"]
+    user_primary    = user_result["primary_joints"]
+
+    # --- Debug print: all joints sorted by std dev ---
+    print("\n" + "="*60)
+    print("[PRIMARY ANGLES DEBUG]")
+    print(f"{'TRAINER (raw cumulative)':^68}")
+    print(f"  {'Joint':<22} {'Std Dev':>10}  {'N Values':>10}")
+    print(f"  {'-'*22} {'-'*10}  {'-'*10}")
+    for j in trainer_result["all_joints_sorted"]:
+        marker = " <--" if j["joint_name"] in trainer_primary else ""
+        print(f"  {j['joint_name']:<22} {j['std_dev']:>10.4f}  {j['data_points']:>10}{marker}")
+    print(f"\n{'USER (interpolated cumulative)':^68}")
+    print(f"  {'Joint':<22} {'Std Dev':>10}  {'N Values':>10}")
+    print(f"  {'-'*22} {'-'*10}  {'-'*10}")
+    for j in user_result["all_joints_sorted"]:
+        marker = " <--" if j["joint_name"] in user_primary else ""
+        print(f"  {j['joint_name']:<22} {j['std_dev']:>10.4f}  {j['data_points']:>10}{marker}")
+    print(f"\n  Trainer primary: {trainer_primary}")
+    print(f"  User primary:    {user_primary}")
+    print("="*60 + "\n")
+    # -------------------------------------------------
+
+    # Not enough data yet — treat as match to avoid false negatives at startup
+    
+
+    # Build std-dev lookup dicts keyed by joint name for fast access
+    trainer_std_map = {j["joint_name"]: j["std_dev"] for j in trainer_result["all_joints_sorted"]}
+    user_std_map    = {j["joint_name"]: j["std_dev"] for j in user_result["all_joints_sorted"]}
+
+    STD_TOLERANCE = 0.40   # ±40 %
+
+    trainer_set = set(trainer_primary)
+    user_set    = set(user_primary)
+
+    if trainer_set == user_set:
+        # Sets match — now check if each user std dev is within ±40 % of trainer's
+        out_of_range = []
+        for joint in sorted(trainer_set):
+            t_std = trainer_std_map.get(joint)
+            u_std = user_std_map.get(joint)
+            if t_std is None or u_std is None or t_std == 0:
+                continue
+            lower = t_std * (1 - STD_TOLERANCE)
+            upper = t_std * (1 + STD_TOLERANCE)
+            if u_std < lower:
+                out_of_range.append(f"More movement needed in {joint} "
+                                    f"(you: {u_std:.1f}°, target: {t_std:.1f}°)")
+            elif u_std > upper:
+                out_of_range.append(f"Reduce movement in {joint} "
+                                    f"(you: {u_std:.1f}°, target: {t_std:.1f}°)")
+
+        if not out_of_range:
+            return {
+                "is_same": 1,
+                "feedback": "Great form! Movement range matches the trainer.",
+                "trainer_primary": trainer_primary,
+                "user_primary": user_primary
+            }
+        else:
+            return {
+                "is_same": 0,
+                "feedback": " | ".join(out_of_range),
+                "trainer_primary": trainer_primary,
+                "user_primary": user_primary
+            }
+
+    else:
+        missing = sorted(trainer_set - user_set)   # trainer uses, user doesn't
+        extra   = sorted(user_set - trainer_set)    # user uses, trainer doesn't
+        parts   = []
+
+        for joint in missing:
+            parts.append(f"Focus more on {joint}")
+
+        for joint in extra:
+            t_std = trainer_std_map.get(joint)
+            u_std = user_std_map.get(joint)
+            if t_std is not None and u_std is not None and u_std > t_std:
+                parts.append(f"Reduce movement in {joint} "
+                             f"(you: {u_std:.1f}°, trainer: {t_std:.1f}°)")
+            else:
+                parts.append(f"Unnecessary movement detected in {joint}")
+
+        feedback_str = " | ".join(parts) if parts else "Adjust your form to match the trainer."
+        return {
+            "is_same": 0,
+            "feedback": feedback_str,
+            "trainer_primary": trainer_primary,
+            "user_primary": user_primary
+        }
+
+
+def _reset_user_primary_angles() -> None:
+    """
+    Reset only the interpolated cumulative stats for all user stores.
+    Raw cumulative data is intentionally preserved.
+    """
+    for store in user_stores.values():
+        store.clear_interpolated_cumulative_stats()
+
+
+async def run_feedback_check() -> None:
+    """
+    Called after every processed batch.
+    Implements the 5-batch primary-angle feedback loop:
+      - Every 5 batches: compare primary joints.
+      - On first mismatch: send negative feedback, set checkflag, start 1-batch-per-check window.
+      - During check window (checkflag=True): silent on mismatch until count reaches 5,
+        then send negative feedback and reset count.
+      - Any match during check window or at the 5-batch gate: send positive feedback,
+        clear all flags, stop checking until next exercise change.
+    """
+    global feedback_batch_count, feedback_check_flag, feedback_complete
+
+    # Once positive feedback has been given, stop until next exercise
+    if feedback_complete:
+        return
+
+    feedback_batch_count += 1
+
+    if feedback_batch_count < 5 and not feedback_check_flag:
+        return  # Still in the initial 5-batch wait window
+
+    result = checkprimaryangles()
+
+    if result["is_same"] == 1:
+        # Positive — stop checking entirely
+        await feedback_manager.send_message(result["feedback"])
+        feedback_batch_count = 0
+        feedback_check_flag  = False
+        feedback_complete    = True
+
+    else:
+        # Negative
+        if feedback_check_flag:
+            # Already in the 1-sec check window
+            if feedback_batch_count >= 5:
+                # End of check window — send negative, restart window
+                await feedback_manager.send_message(result["feedback"])
+                feedback_batch_count = 0
+                _reset_user_primary_angles()
+                # feedback_check_flag stays True
+            # else: silent (count 1-4)
+        else:
+            # First mismatch at the 5-batch gate
+            await feedback_manager.send_message(result["feedback"])
+            feedback_batch_count = 0
+            feedback_check_flag  = True
+            _reset_user_primary_angles()
+
+
+def _reset_feedback_state() -> None:
+    """Reset all feedback algorithm state (called on exercise change / pause / resume)."""
+    global feedback_batch_count, feedback_check_flag, feedback_complete
+    feedback_batch_count = 0
+    feedback_check_flag  = False
+    feedback_complete    = False
+
 
 @app.get("/primary-joints")
 async def get_primary_joints():
