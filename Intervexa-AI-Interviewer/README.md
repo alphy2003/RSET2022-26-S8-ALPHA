@@ -93,7 +93,7 @@
       <a href="https://github.com/Actinker">
         <img src="https://github.com/Actinker.png" width="100" style="border-radius:50%" />
         <br />
-        <b>Actinker</b>
+        <b>Abin A C</b>
       </a>
       <br />
       <sub>Backend Developer</sub>
@@ -102,7 +102,7 @@
       <a href="https://github.com/Aaron-hub-dev-maker">
         <img src="https://github.com/Aaron-hub-dev-maker.png" width="100" style="border-radius:50%" />
         <br />
-        <b>Aaron-hub-dev-maker</b>
+        <b>Aaron maker</b>
       </a>
       <br />
       <sub>Aptitude Developer</sub>
