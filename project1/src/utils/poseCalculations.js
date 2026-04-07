@@ -41,7 +41,7 @@ export const calculateJointAngles = (landmarks) => {
 };
 
 // Create combined workout data snapshot
-export const createWorkoutDataSnapshot = (trainerAngles, userAngles, gesture, gestureConfidence, timestamp, isPlaying) => {
+export const createWorkoutDataSnapshot = (trainerAngles, userAngles, gesture, gestureConfidence, timestamp, isPlaying, isCameraOn) => {
   const data = {
     t: timestamp || Date.now()
   };
@@ -65,6 +65,9 @@ export const createWorkoutDataSnapshot = (trainerAngles, userAngles, gesture, ge
   
   // Add isPlaying state for pause detection
   data.isPlaying = isPlaying;
+
+  // Add isCameraOn state for camera status detection
+  data.isCameraOn = isCameraOn;
 
   return data;
 };

@@ -15,10 +15,7 @@ from pydantic import BaseModel
 import uvicorn
 import numpy as np
 from scipy import interpolate
-from scipy.signal import savgol_filter
-from scipy.ndimage import median_filter
-import onnxruntime as ort
-from repcomparison import compare_reps, score_all_metrics
+import inference
 
 
 # ============================================================================
@@ -737,9 +734,6 @@ last_valid_user_angles: Dict[str, float] = {}     # {joint_name: last_valid_angl
 # Track pause state for statistics reset
 pause_flag = False  # True when video is paused, False when playing
 
-# Track camera state for user pose availability
-camera_on_flag = False  # True when camera is on, False when off
-
 # Track exercise change gestures (Thumb_Up -> Thumb_Down within 3 seconds)
 thumbs_up_timestamp = None  # Timestamp of LAST (latest) Thumb_Up detected
 EXERCISE_CHANGE_WINDOW = 3.0  # seconds - window to detect Thumb_Down after Thumb_Up
@@ -749,197 +743,25 @@ exercise_change_count = 0  # Counter for number of exercise changes
 feedback_batch_count = 0    # increments each batch; resets on exercise change, pause, or after feedback sent
 feedback_check_flag = False # True after first mismatch; cleared on positive feedback or exercise change
 feedback_complete = False   # True after positive feedback; stops all checking until exercise change
-rep_comparison_count = 0    # Counter for rep comparison feedback batches
-last_analyzed_user_reps = []  # List of [start, end] indices of user reps that were last analyzed for feedback
-
-# ============================================================================
-# ONNX MODEL FILTERING CONSTANTS
-# ============================================================================
-
-# Filtering parameters (Savitzky-Golay)
-SAVGOL_WINDOW_REP = 31
-SAVGOL_POLYORDER_REP = 3
-SAVGOL_WINDOW_PHASE = 21
-SAVGOL_POLYORDER_PHASE = 2
-MEDIAN_WINDOW = 5
-
-# Segmentation parameters
-SEG_WINDOW = 50
-SEG_STRIDE = 10
-MIN_PHASE_THRESH = 0.15
-PHASE_RANGE_THRESH = 0.50
 
 # ============================================================================
 # MODEL PRE-LOADING
 # ============================================================================
 
-ONNX_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dualhead_model.onnx")
-rep_session = ort.InferenceSession(ONNX_MODEL_PATH)
-rep_input_name = rep_session.get_inputs()[0].name
-print(f"[MODEL] dualhead_model.onnx loaded")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base_model.pt")
+rep_model, rep_device = inference.load_model(MODEL_PATH)
+print(f"[MODEL] base_model.pt loaded on {rep_device}")
 
 # Track already-detected reps per exercise (list of [start_index, end_index])
 # These use absolute exercise-timeline indices (not window-relative)
 trainer_found_reps: List[List[int]] = []
 user_found_reps: List[List[int]] = []
 
-# Store latest detected rep data for visualization
-last_trainer_rep_data: Optional[dict] = None
-last_user_rep_data: Optional[dict] = None
-
-# Store latest model inference data for visualization
-last_trainer_model_inference: Optional[dict] = None  # Latest trainer model input/output
-last_user_model_inference: Optional[dict] = None     # Latest user model input/output
-
-
-# ============================================================================
-# ONNX MODEL FILTERING FUNCTIONS
-# ============================================================================
-
-def apply_filters(signal, window_length, polyorder, use_median=True, median_size=5):
-    """Apply zero-phase smoothing filters to signal."""
-    filtered = signal.copy()
-
-    # Step 1: Optional median filter for spike removal
-    if use_median and median_size > 0:
-        filtered = median_filter(filtered, size=median_size)
-
-    # Step 2: Savitzky-Golay for smooth curve fitting
-    if window_length >= len(filtered):
-        window_length = len(filtered) - 1
-        if window_length % 2 == 0:
-            window_length -= 1
-
-    if window_length >= 3 and window_length > polyorder:
-        filtered = savgol_filter(filtered, window_length, polyorder)
-
-    return filtered
-
-
-def filter_rep_prob(rep_prob):
-    """Filter rep probability signal."""
-    return apply_filters(
-        rep_prob,
-        window_length=SAVGOL_WINDOW_REP,
-        polyorder=SAVGOL_POLYORDER_REP,
-        use_median=(MEDIAN_WINDOW > 0),
-        median_size=MEDIAN_WINDOW
-    )
-
-
-def filter_phase(phase):
-    """Filter phase signal."""
-    return apply_filters(
-        phase,
-        window_length=SAVGOL_WINDOW_PHASE,
-        polyorder=SAVGOL_POLYORDER_PHASE,
-        use_median=(MEDIAN_WINDOW > 0),
-        median_size=MEDIAN_WINDOW
-    )
-
-
-def segment_reps_core(rep_prob, phase_filtered):
-    """
-    Detect rep boundaries using phase resets + rep_prob validation.
-    """
-    ARRAY_LEN = len(phase_filtered)
-
-    possible_starts = []
-    segments = []
-    skip_until_idx = 0
-
-    # Sliding window
-    for i in range(0, ARRAY_LEN - SEG_WINDOW + 1, SEG_STRIDE):
-        # Skip if in already processed region
-        if i < skip_until_idx:
-            continue
-
-        window_phase = phase_filtered[i : i + SEG_WINDOW]
-        window_rep = rep_prob[i : i + SEG_WINDOW]
-
-        max_p, min_p = window_phase.max(), window_phase.min()
-        sum_diff = np.diff(window_phase).sum()
-
-        # Possible rep start
-        if min_p < MIN_PHASE_THRESH:
-            possible_starts.append(i)
-
-        # Rep end detection
-        if sum_diff < 0 and min_p < MIN_PHASE_THRESH and (max_p - min_p) > PHASE_RANGE_THRESH:
-            # Find index where rep_prob ≈ 0.5
-            rep_end = i + np.argmin(np.abs(window_rep - 0.5))
-            rep_end = min(rep_end, ARRAY_LEN - 1)
-
-            # Find closest start before rep_end
-            valid_starts = [s for s in possible_starts if s < rep_end]
-
-            if not valid_starts:
-                continue
-
-            # Try each valid_start from latest to earliest
-            valid_starts_sorted = sorted(valid_starts, reverse=True)
-            segment_added = False
-
-            for rep_start_candidate in valid_starts_sorted:
-                # Validate start: find index where rep_prob ≈ 0.5 near start [0, +40]
-                start_lo = max(0, rep_start_candidate)
-                start_hi = min(ARRAY_LEN, rep_start_candidate + 40)
-                search_range = rep_prob[start_lo:start_hi]
-                search_range_phase = phase_filtered[start_lo:start_hi]
-
-                # Filter indices to only include where phase < MIN_PHASE_THRESH
-                valid_phase_mask = search_range_phase < MIN_PHASE_THRESH
-                valid_indices = np.where(valid_phase_mask)[0]
-
-                if len(valid_indices) == 0:
-                    continue
-
-                # Sort valid indices by distance from 0.5
-                abs_diff = np.abs(search_range[valid_indices] - 0.5)
-                sorted_valid_indices = valid_indices[np.argsort(abs_diff)]
-
-                found_valid_start = False
-                for idx_in_range in sorted_valid_indices:
-                    closest_to_05_idx = start_lo + idx_in_range
-                    closest_to_05_val = rep_prob[closest_to_05_idx]
-
-                    # Ensure rep_start comes before rep_end
-                    if closest_to_05_idx >= rep_end:
-                        continue
-
-                    # Check minimum gap of 20 frames
-                    gap = abs(rep_end - closest_to_05_idx)
-                    if gap < 30:
-                        continue
-
-                    # Found valid start
-                    rep_start = closest_to_05_idx
-                    found_valid_start = True
-                    break
-
-                if not found_valid_start:
-                    continue
-
-                # Check overlap with existing segments
-                overlapping = False
-                for seg_start, seg_end in segments:
-                    if (rep_end > seg_start and rep_start < seg_end) or (rep_start == rep_end):
-                        overlapping = True
-                        break
-
-                if not overlapping:
-                    segments.append([rep_start, rep_end])
-
-                    # Clean up possible_starts
-                    possible_starts = [s for s in possible_starts if s > i]
-
-                    # Skip ahead
-                    skip_until_idx = rep_end
-
-                    segment_added = True
-                    break
-
-    return segments
+# Store last inference results for the /reps visualization endpoint
+last_trainer_inference: Optional[dict] = None
+last_user_inference: Optional[dict] = None
+last_rep_joint_names: List[str] = []
+last_rep_framecount: int = 0
 
 
 # ============================================================================
@@ -976,106 +798,71 @@ def get_top_6_joints(stores_dict: dict) -> list:
     return joint_names
 
 
-def repsegment(stores_dict: dict, joint_names: list, framecount: int, is_trainer: bool = True) -> list:
+def repsegment(stores_dict: dict, joint_names: list, framecount: int) -> tuple:
     """
-    Run the ONNX rep segmentation model on interpolated_filtered data.
-
+    Run the rep segmentation model on interpolated_filtered data.
+    
     Args:
         stores_dict: trainer_stores or user_stores
         joint_names: list of up to 6 joint names (from get_top_6_joints)
         framecount: number of frames in the current exercise
-        is_trainer: True if this is trainer data, False for user data
-
+    
     Returns:
-        list of [start_index, end_index] pairs
+        tuple of (reps, full_result):
+          reps: list of [start_index, end_index, [6 array slices]]
+          full_result: full inference dict from predict_with_model
     """
     arrays = []
-
+    
     for jname in joint_names:
         store = stores_dict.get(jname)
         if store is None:
             # Joint not found — use zeros
             arrays.append(np.zeros(min(framecount, 480), dtype="float32"))
             continue
-
+        
         # Extract only current exercise data (from statistics_reset_index onward)
         exercise_data = store.interpolated_filtered[store.statistics_reset_index:]
-
+        
         if framecount > 480:
             # Take last 480 frames
             data_slice = exercise_data[-480:]
         else:
             # Take last framecount frames
             data_slice = exercise_data[-framecount:] if framecount > 0 else []
-
+        
         arrays.append(np.array(data_slice, dtype="float32"))
-
+    
     # Pad to 6 arrays if fewer joints provided
     while len(arrays) < 6:
         target_len = min(framecount, 480) if framecount > 0 else 1
         arrays.append(np.zeros(target_len, dtype="float32"))
-
-    # Stack into (N, 6) where N <= 480
-    joint_angles = np.column_stack(arrays)
-
-    # Pad/truncate to exactly 480 frames
-    if joint_angles.shape[0] < 480:
-        padded = np.zeros((480, 6), dtype="float32")
-        padded[-joint_angles.shape[0]:] = joint_angles
-        joint_angles = padded
-    elif joint_angles.shape[0] > 480:
-        joint_angles = joint_angles[-480:]
-
-    # Run ONNX inference
-    window = joint_angles[np.newaxis, ...].astype(np.float32)  # (1, 480, 6)
-    rep_logits, phase_pred = rep_session.run(None, {rep_input_name: window})
-
-    # Softmax to get rep_prob
-    rep_exp = np.exp(rep_logits - rep_logits.max(axis=-1, keepdims=True))
-    rep_prob = (rep_exp[..., 1] / rep_exp.sum(axis=-1))[0]  # (480,)
-    phase = phase_pred[0]  # (480,)
-
-
-    phase_filtered = filter_phase(phase)
-
-    # Store model inference data for visualization
-    global last_trainer_model_inference, last_user_model_inference
-
-    inference_data = {
-        "joint_names": joint_names,
-        "joint_angles": [joint_angles[:, i].tolist() for i in range(6)],
-        "rep_prob": rep_prob.tolist(),
-        "phase": phase.tolist(),
-        "phase_filtered": phase_filtered.tolist(),
-        "timestamp": datetime.now().isoformat()
-    }
-
-    if is_trainer:
-        last_trainer_model_inference = inference_data
-    else:
-        last_user_model_inference = inference_data
-
-    # Segment reps
-    segments = segment_reps_core(rep_prob, phase_filtered)
-
+    
+    # Run model
+    result = inference.predict_with_model(arrays, rep_model, rep_device)
+    reps = result["reps"]
+    
     # Offset indices to absolute exercise-timeline positions
+    # Model returns indices relative to the 480-frame window (0-479).
+    # When framecount > 480, the window starts at (framecount - 480),
+    # so we add that offset to get the true exercise-timeline index.
     if framecount > 480:
         offset = framecount - 480
-        for seg in segments:
-            seg[0] += offset
-            seg[1] += offset
-
-    return segments
+        for rep in reps:
+            rep[0] += offset  # start_index
+            rep[1] += offset  # end_index
+    
+    return reps, result
 
 
 def is_overlapping_rep(new_start: int, new_end: int, found_reps: list) -> bool:
     """
     Check if a new rep overlaps with any already-found rep.
-
+    
     Overlap condition:
       - new_start falls within an existing rep (start >= existing_start AND start <= existing_end)
       - OR new_end falls within an existing rep (end >= existing_start AND end <= existing_end)
-
+    
     Returns True if overlapping (i.e. duplicate), False if new.
     """
     for existing in found_reps:
@@ -1086,158 +873,17 @@ def is_overlapping_rep(new_start: int, new_end: int, found_reps: list) -> bool:
     return False
 
 
-def extract_rep_angles(stores_dict: dict, rep_indices: List[int], primary_joints: List[str]) -> dict:
-    """
-    Extract angle values for a detected rep from primary joints.
-
-    Args:
-        stores_dict: trainer_stores or user_stores
-        rep_indices: [start_idx, end_idx] from found_reps
-        primary_joints: list of primary joint names
-
-    Returns:
-        dict mapping joint_name -> list of angle values
-    """
-    if not rep_indices or len(rep_indices) < 2:
-        return {}
-
-    start_idx, end_idx = rep_indices[0], rep_indices[1]
-    result = {}
-
-    for joint_name in primary_joints:
-        store = stores_dict.get(joint_name)
-        if store is None:
-            continue
-
-        reset_idx = store.statistics_reset_index
-        abs_start = reset_idx + start_idx
-        abs_end = reset_idx + end_idx + 1
-
-        if abs_end <= len(store.interpolated_filtered):
-            result[joint_name] = store.interpolated_filtered[abs_start:abs_end]
-        else:
-            # Partial data available
-            result[joint_name] = store.interpolated_filtered[abs_start:]
-
-    return result
-
-
 def feedbacksystem(user_reps: list, trainer_reps: list, joint_names: list):
     """
-    Compare user reps against trainer reps and provide feedback.
-
-    Algorithm:
-        - Increment counter each call
-        - When count >= 5 AND both user and trainer reps exist:
-            - Check if these reps were already analyzed (prevent duplicates)
-            - Compare up to 3 latest user reps against latest trainer rep
-            - Average scores across comparisons
-            - Send feedback for lowest-scored metric
-            - Store analyzed reps to prevent duplicate feedback
-            - Reset counter
-
+    Placeholder for future rep analysis and feedback.
+    
     Args:
-        user_reps: list of [start, end] for newly detected user reps
-        trainer_reps: list of [start, end] for newly detected trainer reps
+        user_reps: list of [start, end, [6 array slices]] for user
+        trainer_reps: list of [start, end, [6 array slices]] for trainer
         joint_names: list of joint names used
     """
-    global rep_comparison_count, user_found_reps, trainer_found_reps, last_analyzed_user_reps
-
-    rep_comparison_count += 1
-
-    if rep_comparison_count < 5:
-        return
-
-    # Need at least one rep from each
-    if not user_found_reps or not trainer_found_reps:
-        return
-
-    # Get up to 3 latest user reps
-    num_comparisons = min(3, len(user_found_reps))
-    latest_user_reps = user_found_reps[-num_comparisons:]  # Take last N
-
-    # Check if these reps have already been analyzed to prevent duplicate feedback
-    if latest_user_reps == last_analyzed_user_reps:
-        return
-
-    # Get primary joints for angle extraction
-    primary_result = calculate_primary_joints(trainer_stores)
-    primary_joints = primary_result["primary_joints"]
-
-    # Use the single primary joint for comparison (most distinctive movement)
-    primary_joint = primary_joints[0] if primary_joints else None
-    if not primary_joint:
-        return
-
-    # Get latest trainer rep angles
-    latest_trainer = trainer_found_reps[-1]
-    trainer_angles = extract_rep_angles(trainer_stores, latest_trainer, [primary_joint])
-    trainer_array = trainer_angles.get(primary_joint)
-    if trainer_array is None or len(trainer_array) == 0:
-        return
-
-    # Accumulate scores
-    score_sums = {'speed': 0, 'mae': 0, 'rmse': 0, 'rom': 0, 'max_deviation': 0}
-    valid_comparisons = 0
-
-    for user_rep in latest_user_reps:
-        user_angles = extract_rep_angles(user_stores, user_rep, [primary_joint])
-        user_array = user_angles.get(primary_joint)
-        if user_array is None or len(user_array) == 0:
-            continue
-
-        # Convert to numpy arrays
-        user_np = np.array(user_array, dtype=np.float32)
-        trainer_np = np.array(trainer_array, dtype=np.float32)
-
-        # Get comparison results and scores
-        results = compare_reps(user_np, trainer_np)
-        scores = score_all_metrics(results)
-
-        # Accumulate scores
-        for metric in score_sums.keys():
-            score_sums[metric] += scores[metric]['score']
-        valid_comparisons += 1
-
-    if valid_comparisons == 0:
-        return
-
-    # Calculate averages
-    avg_scores = {metric: total / valid_comparisons for metric, total in score_sums.items()}
-
-    # Find lowest scored metric
-    lowest_metric = min(avg_scores, key=avg_scores.get)
-    lowest_score = avg_scores[lowest_metric]
-
-    # Generate feedback message for lowest metric
-    feedback_messages = {
-        'speed': "Focus on matching the trainer's tempo.",
-        'mae': "Focus on matching the trainer's movement pattern more closely.",
-        'rmse': "Keep your movements smooth and consistent throughout each rep.",
-        'rom': "Adjust your range of motion to match the trainer.",
-        'max_deviation': "Pay attention to form breakdowns during the movement."
-    }
-
-    message = f"{lowest_metric.upper()} needs work (score: {lowest_score:.1f}). {feedback_messages[lowest_metric]}"
-
-    # Send feedback via WebSocket
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(feedback_manager.send_message(message))
-        else:
-            loop.run_until_complete(feedback_manager.send_message(message))
-    except Exception as e:
-        print(f"[FEEDBACK] Error sending message: {e}")
-
-    print(f"[FEEDBACK] Rep comparison: {message}")
-
-    # Store the analyzed reps to prevent duplicate feedback next time
-    last_analyzed_user_reps = [list(rep) for rep in latest_user_reps]
-
-    # Reset counter
-    rep_comparison_count = 0
+    # Future: compare user reps against trainer reps using repcomparison.py
+    pass
 
 
 def run_rep_segmentation():
@@ -1248,70 +894,51 @@ def run_rep_segmentation():
     Filters out already-detected reps using overlap checking.
     """
     global trainer_found_reps, user_found_reps
-    global last_trainer_rep_data, last_user_rep_data
-
+    global last_trainer_inference, last_user_inference, last_rep_joint_names, last_rep_framecount
+    
     # Get the top 6 joints from trainer (trainer defines the exercise)
     joint_names = get_top_6_joints(trainer_stores)
-    print("Top joints for segmentation:", joint_names)
-
+    
     if len(joint_names) == 0:
         return  # No joints with data yet
-
+    
     # Get frame count for current exercise
     framecount = get_exercise_frame_count(trainer_stores)
-
+    
     if framecount < 60:
         return  # Less than ~1 second of data, not enough for segmentation
-
-    # Run rep segmentation on both trainer and user (returns list of [start, end])
-    trainer_reps = repsegment(trainer_stores, joint_names, framecount, is_trainer=True)
-    user_reps = repsegment(user_stores, joint_names, framecount, is_trainer=False)
-
+    
+    # Run rep segmentation on both trainer and user
+    trainer_reps, trainer_inf = repsegment(trainer_stores, joint_names, framecount)
+    user_reps, user_inf = repsegment(user_stores, joint_names, framecount)
+    
+    # Store inference results for visualization endpoint
+    last_trainer_inference = trainer_inf
+    last_user_inference = user_inf
+    last_rep_joint_names = joint_names
+    last_rep_framecount = framecount
+    
     # Filter out overlapping (already-detected) reps for trainer
     new_trainer_reps = []
     for rep in trainer_reps:
         if not is_overlapping_rep(rep[0], rep[1], trainer_found_reps):
             new_trainer_reps.append(rep)
             trainer_found_reps.append([rep[0], rep[1]])
-    print("trainer reps (new):", new_trainer_reps)
-
+    
     # Filter out overlapping (already-detected) reps for user
     new_user_reps = []
     for rep in user_reps:
         if not is_overlapping_rep(rep[0], rep[1], user_found_reps):
             new_user_reps.append(rep)
             user_found_reps.append([rep[0], rep[1]])
-
-    print("user reps (new):", new_user_reps)
+    
     # Print compact rep count line whenever a new rep is detected
-    # if new_trainer_reps or new_user_reps:
-        
-        # print(f"user rep {len(user_found_reps)}\ttrainer rep {len(trainer_found_reps)}")
-
+    if new_trainer_reps or new_user_reps:
+        print(f"user rep {len(user_found_reps)}\ttrainer rep {len(trainer_found_reps)}")
+    
     # Send only new (non-overlapping) reps to feedback system
     if new_trainer_reps or new_user_reps:
         feedbacksystem(new_user_reps, new_trainer_reps, joint_names)
-
-    # Store latest rep data for visualization
-    primary_result = calculate_primary_joints(trainer_stores)
-    primary_joints = primary_result["primary_joints"]
-    if trainer_found_reps:
-        latest_trainer_rep = trainer_found_reps[-1]
-        last_trainer_rep_data = {
-            "angles": extract_rep_angles(trainer_stores, latest_trainer_rep, primary_joints),
-            "start": latest_trainer_rep[0],
-            "end": latest_trainer_rep[1],
-            "rep_number": len(trainer_found_reps)
-        }
-
-    if user_found_reps:
-        latest_user_rep = user_found_reps[-1]
-        last_user_rep_data = {
-            "angles": extract_rep_angles(user_stores, latest_user_rep, primary_joints),
-            "start": latest_user_rep[0],
-            "end": latest_user_rep[1],
-            "rep_number": len(user_found_reps)
-        }
 
 
 # ============================================================================
@@ -1378,6 +1005,12 @@ def process_batch(batch_data: Dict) -> Dict:
                 # Clear found reps for new exercise
                 trainer_found_reps.clear()
                 user_found_reps.clear()
+                # Clear inference results for visualization
+                global last_trainer_inference, last_user_inference, last_rep_joint_names, last_rep_framecount
+                last_trainer_inference = None
+                last_user_inference = None
+                last_rep_joint_names = []
+                last_rep_framecount = 0
             else:
                 # Thumb_Down came too late, reset waiting state
                 thumbs_up_timestamp = None
@@ -1414,39 +1047,14 @@ def process_batch(batch_data: Dict) -> Dict:
             thumbs_up_timestamp = None  # Reset gesture state
             _reset_feedback_state()
             stats['statistics_reset_at_frame'] = stats['frames_processed']
-
-        # Extract isCameraOn from frame and detect camera state transitions
-        is_camera_on = frame.get('isCameraOn', False)
-
-        global camera_on_flag
-
-        if not is_camera_on and camera_on_flag:
-            # Camera just turned off - clear user data and feedback state
-            camera_on_flag = False
-            print("[CAMERA OFF] Camera turned off - clearing user average values and feedback state")
-            for store in user_stores.values():
-                store.clear_average_values()
-            thumbs_up_timestamp = None
-            _reset_feedback_state()
-            stats['camera_state_changed_at_frame'] = stats['frames_processed']
-
-        elif is_camera_on and not camera_on_flag:
-            # Camera just turned on - clear user data and feedback state
-            camera_on_flag = True
-            print("[CAMERA ON] Camera turned on - clearing user average values and feedback state")
-            for store in user_stores.values():
-                store.clear_average_values()
-            thumbs_up_timestamp = None
-            _reset_feedback_state()
-            stats['camera_state_changed_at_frame'] = stats['frames_processed']
-
+        
         # Skip joint data processing entirely while video is paused
         if not is_playing:
             continue
 
         # Process each joint key in the frame
         for key, value in frame.items():
-            if key in ('t', 'gest', 'isPlaying', 'isCameraOn'):  # Skip metadata fields
+            if key in ('t', 'gest', 'isPlaying'):  # Skip timestamp, gesture, and isPlaying
                 continue
             
             # Determine if this is trainer or user data
@@ -1458,10 +1066,6 @@ def process_batch(batch_data: Dict) -> Dict:
                 prefix = 'u_'
                 is_trainer = False
                 stores_dict = user_stores
-
-                # Skip user data processing when camera is off
-                if not camera_on_flag:
-                    continue
             else:
                 continue
             
@@ -1667,12 +1271,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 stats = process_batch(batch_data)
 
                 # Run primary-angle feedback check (only while video is playing)
-                if not pause_flag and camera_on_flag:
+                if not pause_flag:
                     await run_feedback_check()
 
                 # Run rep segmentation on every batch after primary joints are corrected
-                # Requires: feedback complete AND video playing AND camera on
-                if feedback_complete and not pause_flag and camera_on_flag:
+                if feedback_complete:
                     run_rep_segmentation()
 
                 # Broadcast update to all connected plot viewers
@@ -1709,6 +1312,7 @@ async def root():
         "message": "Posture Data Processor is running",
         "websocket_endpoint": "/ws",
         "plot_endpoint": "/plot",
+        "reps_endpoint": "/reps",
         "status": "active"
     }
 
@@ -2475,20 +2079,11 @@ async def run_feedback_check() -> None:
 
 
 def _reset_feedback_state() -> None:
-    """Reset all feedback algorithm state and model inference data (called on exercise change / pause / resume)."""
+    """Reset all feedback algorithm state (called on exercise change / pause / resume)."""
     global feedback_batch_count, feedback_check_flag, feedback_complete
-    global last_trainer_model_inference, last_user_model_inference
-    global rep_comparison_count, last_analyzed_user_reps
-
     feedback_batch_count = 0
     feedback_check_flag  = False
     feedback_complete    = False
-    rep_comparison_count = 0
-    last_analyzed_user_reps = []
-
-    # Reset model inference visualization data
-    last_trainer_model_inference = None
-    last_user_model_inference = None
 
 
 @app.get("/primary-joints")
@@ -3314,291 +2909,467 @@ async def get_interpolated_filtered_angle(role: str, joint_name: str):
     return store.interpolated_filtered if len(store.interpolated_filtered) > 0 else []
 
 
-@app.get("/api/model-inference-data")
-async def get_model_inference_data(role: str = "trainer"):
-    """
-    Get the latest model inference data for visualization.
+# ============================================================================
+# REP VISUALIZATION ENDPOINTS
+# ============================================================================
 
-    Args:
-        role: "trainer" or "user"
-
-    Returns:
-        Joint angles input (6 x 480), rep_prob (480), phase (480), phase_filtered (480)
-    """
-    if role == "trainer":
-        data = last_trainer_model_inference
-    else:
-        data = last_user_model_inference
-
-    if data is None:
+@app.get("/api/rep-data")
+async def get_rep_data():
+    """JSON endpoint returning last inference results for rep visualization"""
+    def _serialize_inference(inf_dict):
+        if inf_dict is None:
+            return None
         return {
-            "error": f"No inference data available for {role}",
-            "joint_names": [],
-            "joint_angles": [],
-            "rep_prob": [],
-            "phase": [],
-            "phase_filtered": [],
-            "timestamp": None
+            "original_arrays": [arr.tolist() if hasattr(arr, 'tolist') else list(arr) for arr in inf_dict["original_arrays"]],
+            "labels_final": inf_dict["labels_final"].tolist() if hasattr(inf_dict["labels_final"], 'tolist') else list(inf_dict["labels_final"]),
+            "conf_phase1": inf_dict["conf_phase1"].tolist() if hasattr(inf_dict["conf_phase1"], 'tolist') else list(inf_dict["conf_phase1"]),
+            "conf_phase2": inf_dict["conf_phase2"].tolist() if hasattr(inf_dict["conf_phase2"], 'tolist') else list(inf_dict["conf_phase2"]),
         }
 
-    return data
+    return {
+        "joint_names": last_rep_joint_names,
+        "frame_count": last_rep_framecount,
+        "offset": max(0, last_rep_framecount - 480) if last_rep_framecount > 0 else 0,
+        "trainer": {
+            "inference": _serialize_inference(last_trainer_inference),
+            "found_reps": [[r[0], r[1]] for r in trainer_found_reps],
+            "rep_count": len(trainer_found_reps),
+        },
+        "user": {
+            "inference": _serialize_inference(last_user_inference),
+            "found_reps": [[r[0], r[1]] for r in user_found_reps],
+            "rep_count": len(user_found_reps),
+        },
+    }
 
 
-@app.get("/model-inference-plot", response_class=HTMLResponse)
-async def get_model_inference_plot_page(role: str = "trainer"):
-    """
-    Live visualization of ONNX model inputs and outputs.
-    Shows 6 joint angle inputs + rep_prob/phase predictions.
-    """
-    html_content = f"""
+@app.get("/reps", response_class=HTMLResponse)
+async def get_reps_page():
+    """HTML page with uPlot charts showing identified reps with colored regions"""
+    html_content = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Model Inference - {role.title()}</title>
+        <title>Rep Segmentation - Live View</title>
         <script src="https://unpkg.com/uplot@1.6.24/dist/uPlot.iife.min.js"></script>
         <link rel="stylesheet" href="https://unpkg.com/uplot@1.6.24/dist/uPlot.min.css">
         <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-            body {{
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
                 font-family: 'Segoe UI', Arial, sans-serif;
                 background: #0f172a;
                 color: #e2e8f0;
                 padding: 20px;
-            }}
-            .container {{ max-width: 1600px; margin: 0 auto; }}
-            h1 {{ text-align: center; margin-bottom: 10px; color: #f8fafc; }}
-            .role-toggle {{
+            }
+            .container { max-width: 1800px; margin: 0 auto; }
+            h1 {
+                text-align: center;
+                font-size: 24px;
+                margin-bottom: 16px;
+                color: #f8fafc;
+            }
+
+            /* Rep counter banner */
+            .rep-banner {
                 display: flex;
                 justify-content: center;
-                gap: 10px;
+                gap: 40px;
                 margin-bottom: 20px;
-            }}
-            .role-btn {{
-                padding: 10px 24px;
-                border: none;
-                border-radius: 8px;
-                font-size: 14px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all 0.2s;
-            }}
-            .role-btn.active {{
+            }
+            .rep-count-box {
+                background: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 12px;
+                padding: 16px 32px;
+                text-align: center;
+                min-width: 180px;
+            }
+            .rep-count-box .label {
+                font-size: 13px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: #94a3b8;
+                margin-bottom: 6px;
+            }
+            .rep-count-box .count {
+                font-size: 42px;
+                font-weight: 700;
+            }
+            .rep-count-box.trainer .count { color: #4ade80; }
+            .rep-count-box.user .count { color: #60a5fa; }
+
+            /* Info box */
+            .info-box {
+                background: #1e293b;
+                border-left: 4px solid #6366f1;
+                padding: 14px 18px;
+                margin-bottom: 20px;
+                border-radius: 4px;
+                font-size: 13px;
+                line-height: 1.7;
+                color: #cbd5e1;
+            }
+            .info-box code { color: #a5b4fc; }
+
+            /* Legend */
+            .legend-bar {
+                display: flex;
+                justify-content: center;
+                gap: 28px;
+                margin-bottom: 18px;
+                font-size: 13px;
+            }
+            .legend-item {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            .legend-swatch {
+                width: 18px;
+                height: 14px;
+                border-radius: 3px;
+                display: inline-block;
+            }
+
+            .refresh-button {
+                display: block;
+                margin: 0 auto 20px;
+                padding: 10px 30px;
                 background: #6366f1;
                 color: white;
-            }}
-            .role-btn:not(.active) {{
-                background: #334155;
-                color: #94a3b8;
-            }}
-            .section-title {{
-                font-size: 18px;
-                font-weight: 600;
-                margin: 20px 0 10px;
-                padding-left: 12px;
-                border-left: 4px solid #6366f1;
-            }}
-            .charts-grid {{
-                display: grid;
-                grid-template-columns: repeat(3, 1fr);
-                gap: 16px;
+                border: none;
+                border-radius: 6px;
+                font-size: 15px;
+                cursor: pointer;
+                transition: background .15s;
+            }
+            .refresh-button:hover { background: #4f46e5; }
+
+            /* No-data message */
+            .no-data {
+                text-align: center;
+                padding: 60px 20px;
+                color: #64748b;
+                font-size: 16px;
+            }
+
+            /* Charts */
+            .joint-section {
                 margin-bottom: 24px;
-            }}
-            .chart-card {{
-                background: #1e293b;
-                border-radius: 10px;
-                padding: 12px;
-            }}
-            .chart-title {{
-                font-size: 13px;
+            }
+            .joint-title {
+                font-size: 15px;
                 font-weight: 600;
+                color: #e2e8f0;
                 margin-bottom: 8px;
-                color: #94a3b8;
-            }}
-            .output-chart {{
+                padding-left: 4px;
+            }
+            .chart-row {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 12px;
+            }
+            .chart-card {
                 background: #1e293b;
-                border-radius: 10px;
-                padding: 16px;
-            }}
-            .status {{
-                text-align: center;
+                border-radius: 8px;
+                padding: 12px;
+                border: 1px solid #334155;
+            }
+            .chart-card h4 {
                 font-size: 12px;
-                color: #64748b;
-                margin-top: 16px;
-            }}
-            .no-data {{
-                text-align: center;
-                padding: 40px;
-                color: #64748b;
-            }}
+                color: #94a3b8;
+                margin-bottom: 6px;
+                text-transform: uppercase;
+                letter-spacing: .5px;
+            }
+            .u-legend { font-size: 11px !important; color: #94a3b8 !important; }
+            .u-legend .u-series th { color: #94a3b8 !important; }
+
+            @media (max-width: 900px) {
+                .chart-row { grid-template-columns: 1fr; }
+            }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>Model Inference Visualization</h1>
+            <h1>Rep Segmentation &mdash; Live View</h1>
 
-            <div class="role-toggle">
-                <button class="role-btn {'active' if role == 'trainer' else ''}"
-                        onclick="window.location.href='/model-inference-plot?role=trainer'">
-                    Trainer
-                </button>
-                <button class="role-btn {'active' if role == 'user' else ''}"
-                        onclick="window.location.href='/model-inference-plot?role=user'">
-                    User
-                </button>
+            <div class="rep-banner">
+                <div class="rep-count-box trainer">
+                    <div class="label">Trainer Reps</div>
+                    <div class="count" id="trainer-rep-count">0</div>
+                </div>
+                <div class="rep-count-box user">
+                    <div class="label">User Reps</div>
+                    <div class="count" id="user-rep-count">0</div>
+                </div>
             </div>
 
-            <div class="section-title">Model Input: Joint Angles (480 frames × 6 joints)</div>
-            <div class="charts-grid" id="inputCharts"></div>
+            <div class="legend-bar">
+                <div class="legend-item"><span class="legend-swatch" style="background:rgba(74,222,128,.35)"></span> Phase 1 (concentric)</div>
+                <div class="legend-item"><span class="legend-swatch" style="background:rgba(251,146,60,.35)"></span> Phase 2 (eccentric)</div>
+                <div class="legend-item"><span class="legend-swatch" style="background:transparent;border:1.5px dashed #a78bfa"></span> Rep boundaries</div>
+            </div>
 
-            <div class="section-title">Model Output: Rep Probability & Phase</div>
-            <div class="output-chart" id="outputChart"></div>
+            <div class="info-box">
+                <strong>Model:</strong> UNet-BiLSTM &middot; 6 top-std-dev joints &middot; 480-frame window @ 60 FPS<br>
+                <strong>Labels:</strong> <code>0</code> rest &middot; <code>1</code> phase 1 &middot; <code>2</code> phase 2<br>
+                <strong>Updates:</strong> Real-time via WebSocket (auto-refreshes when new data arrives)
+            </div>
 
-            <div class="status" id="status">Connecting...</div>
+            <button class="refresh-button" onclick="loadData()">Manual Refresh</button>
+
+            <div id="charts-container">
+                <div class="no-data" id="no-data-msg">Waiting for rep segmentation data&hellip;</div>
+            </div>
         </div>
 
         <script>
-        (function() {{
-            const role = '{role}';
-            const inputCharts = {{}};
-            let outputChart = null;
+        (function() {
+            const PHASE1_COLOR = 'rgba(74, 222, 128, 0.18)';
+            const PHASE2_COLOR = 'rgba(251, 146, 60, 0.18)';
+            const REP_BORDER   = '#a78bfa';
 
-            // Create input charts (one per joint)
-            function createInputChart(container, jointName) {{
-                const card = document.createElement('div');
-                card.className = 'chart-card';
-                card.innerHTML = '<div class="chart-title">' + jointName + '</div>';
-                container.appendChild(card);
+            let currentJoints = [];
+            let charts = {};  // key: "joint|role" => uPlot instance
 
-                const opts = {{
-                    width: card.clientWidth - 24,
-                    height: 150,
-                    scales: {{
-                        x: {{ time: false }},
-                        y: {{ range: [0, 180] }}
-                    }},
+            function destroyAllCharts() {
+                Object.values(charts).forEach(u => u.destroy());
+                charts = {};
+            }
+
+            function makeDrawHook(labelsRef, repsRef) {
+                // labelsRef and repsRef are objects with a .v property we update
+                return function(u) {
+                    const ctx = u.ctx;
+                    const labels = labelsRef.v;
+                    const reps = repsRef.v;
+                    if (!labels || labels.length === 0) return;
+
+                    const xScale = u.scales.x;
+                    const yScale = u.scales.y;
+                    const left   = u.bbox.left;
+                    const top    = u.bbox.top;
+                    const width  = u.bbox.width;
+                    const height = u.bbox.height;
+
+                    // Draw phase bands from labels array
+                    let i = 0;
+                    while (i < labels.length) {
+                        const lbl = labels[i];
+                        if (lbl === 1 || lbl === 2) {
+                            const start = i;
+                            while (i < labels.length && labels[i] === lbl) i++;
+                            const end = i - 1;
+
+                            const x0 = u.valToPos(start, 'x', true);
+                            const x1 = u.valToPos(end, 'x', true);
+
+                            ctx.save();
+                            ctx.fillStyle = lbl === 1 ? PHASE1_COLOR : PHASE2_COLOR;
+                            ctx.fillRect(x0, top, x1 - x0, height);
+                            ctx.restore();
+                        } else {
+                            i++;
+                        }
+                    }
+
+                    // Draw rep boundary lines
+                    if (reps && reps.length > 0) {
+                        ctx.save();
+                        ctx.strokeStyle = REP_BORDER;
+                        ctx.lineWidth = 1.5;
+                        ctx.setLineDash([4, 4]);
+
+                        for (const rep of reps) {
+                            // rep indices are absolute; labels are 0-479 window
+                            // The API already provides found_reps in absolute indices
+                            // but label indices match the window, so we don't need offset here
+                            // We draw from the 'found_reps' mapped to the 480 window
+                            const sx = u.valToPos(rep[0], 'x', true);
+                            const ex = u.valToPos(rep[1], 'x', true);
+
+                            ctx.beginPath();
+                            ctx.moveTo(sx, top);
+                            ctx.lineTo(sx, top + height);
+                            ctx.stroke();
+
+                            ctx.beginPath();
+                            ctx.moveTo(ex, top);
+                            ctx.lineTo(ex, top + height);
+                            ctx.stroke();
+                        }
+                        ctx.restore();
+                    }
+                };
+            }
+
+            function createChart(container, role, jointIdx, labelsRef, repsRef) {
+                const color = role === 'trainer' ? '#4ade80' : '#60a5fa';
+                const opts = {
+                    width: container.clientWidth - 24,
+                    height: 200,
+                    scales: {
+                        x: { time: false },
+                        y: { range: [0, 180] }
+                    },
                     series: [
-                        {{}},
-                        {{ stroke: role === 'trainer' ? '#4ade80' : '#60a5fa', width: 1.5, points: {{ show: false }} }}
+                        { label: 'Frame', value: (u, v) => v != null ? v : '-' },
+                        {
+                            label: 'Angle',
+                            stroke: color,
+                            width: 1.8,
+                            points: { show: false }
+                        }
                     ],
                     axes: [
-                        {{ stroke: '#64748b', grid: {{ stroke: 'rgba(100,116,139,0.2)' }} }},
-                        {{ stroke: '#64748b', grid: {{ stroke: 'rgba(100,116,139,0.2)' }}, label: '°' }}
+                        { stroke: '#475569', grid: { stroke: '#1e293b', width: 1 }, ticks: { stroke: '#334155' }, font: '11px sans-serif', labelFont: '11px sans-serif' },
+                        { stroke: '#475569', grid: { stroke: '#1e293b', width: 1 }, ticks: { stroke: '#334155' }, label: 'Angle (deg)', font: '11px sans-serif', labelFont: '12px sans-serif', labelGap: 8 }
                     ],
-                    legend: {{ show: false }}
-                }};
+                    hooks: {
+                        draw: [makeDrawHook(labelsRef, repsRef)]
+                    },
+                    legend: { show: false },
+                    cursor: { show: true, drag: { x: false, y: false } }
+                };
 
-                return new uPlot(opts, [[0], [0]], card);
-            }}
+                const data = [[0], [null]];
+                return new uPlot(opts, data, container);
+            }
 
-            // Create output chart (rep_prob + phase + phase_filtered)
-            function createOutputChart(container) {{
-                const opts = {{
-                    width: container.clientWidth - 32,
-                    height: 250,
-                    scales: {{
-                        x: {{ time: false }},
-                        y: {{ range: [0, 1] }}
-                    }},
-                    series: [
-                        {{}},
-                        {{ label: 'Rep Prob', stroke: '#f97316', width: 2, points: {{ show: false }} }},
-                        {{ label: 'Phase (raw)', stroke: '#a855f7', width: 1.5, points: {{ show: false }} }},
-                        {{ label: 'Phase (filtered)', stroke: '#22d3ee', width: 2, points: {{ show: false }} }}
-                    ],
-                    axes: [
-                        {{ stroke: '#64748b', grid: {{ stroke: 'rgba(100,116,139,0.2)' }}, label: 'Frame Index' }},
-                        {{ stroke: '#64748b', grid: {{ stroke: 'rgba(100,116,139,0.2)' }}, label: 'Value (0-1)' }}
-                    ],
-                    legend: {{ show: true }}
-                }};
+            function buildCharts(jointNames) {
+                destroyAllCharts();
+                const container = document.getElementById('charts-container');
+                container.innerHTML = '';
+                if (!jointNames || jointNames.length === 0) {
+                    container.innerHTML = '<div class="no-data">No active joints detected yet.</div>';
+                    return;
+                }
 
-                return new uPlot(opts, [[0], [0], [0], [0]], container);
-            }}
+                jointNames.forEach((jname, jIdx) => {
+                    const section = document.createElement('div');
+                    section.className = 'joint-section';
+                    section.innerHTML = '<div class="joint-title">' + jname + ' (#' + (jIdx + 1) + ')</div>';
 
-            async function loadData() {{
-                try {{
-                    const res = await fetch('/api/model-inference-data?role=' + role);
-                    const data = await res.json();
+                    const row = document.createElement('div');
+                    row.className = 'chart-row';
 
-                    if (data.error || !data.joint_names || data.joint_names.length === 0) {{
-                        document.getElementById('status').textContent = 'Waiting for model inference...';
-                        return;
-                    }}
+                    ['trainer', 'user'].forEach(role => {
+                        const card = document.createElement('div');
+                        card.className = 'chart-card';
+                        card.innerHTML = '<h4>' + role + '</h4>';
+                        const wrap = document.createElement('div');
+                        wrap.id = 'chart-' + role + '-' + jIdx;
+                        card.appendChild(wrap);
+                        row.appendChild(card);
+                    });
 
-                    const inputContainer = document.getElementById('inputCharts');
-                    const outputContainer = document.getElementById('outputChart');
+                    section.appendChild(row);
+                    container.appendChild(section);
+                });
 
-                    // Initialize charts if not created yet
-                    if (Object.keys(inputCharts).length === 0) {{
-                        inputContainer.innerHTML = '';
-                        data.joint_names.forEach((name, idx) => {{
-                            inputCharts[name] = createInputChart(inputContainer, name);
-                        }});
-                        outputChart = createOutputChart(outputContainer);
-                    }}
+                // Create uPlot instances after DOM is ready
+                requestAnimationFrame(() => {
+                    jointNames.forEach((jname, jIdx) => {
+                        ['trainer', 'user'].forEach(role => {
+                            const wrap = document.getElementById('chart-' + role + '-' + jIdx);
+                            if (!wrap) return;
+                            const labelsRef = { v: [] };
+                            const repsRef = { v: [] };
+                            const key = jname + '|' + role;
+                            const u = createChart(wrap, role, jIdx, labelsRef, repsRef);
+                            charts[key] = u;
+                            u._labelsRef = labelsRef;
+                            u._repsRef = repsRef;
+                        });
+                    });
+                });
+            }
 
-                    // Update input charts
-                    data.joint_names.forEach((name, idx) => {{
-                        const angles = data.joint_angles[idx] || [];
-                        const frames = angles.map((_, i) => i);
-                        if (inputCharts[name]) {{
-                            inputCharts[name].setData([frames, angles]);
-                        }}
-                    }});
+            function arraysEqual(a, b) {
+                if (a.length !== b.length) return false;
+                for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+                return true;
+            }
 
-                    // Update output chart
-                    if (outputChart && data.rep_prob) {{
-                        const frames = data.rep_prob.map((_, i) => i);
-                        outputChart.setData([
-                            frames,
-                            data.rep_prob,
-                            data.phase,
-                            data.phase_filtered
-                        ]);
-                    }}
+            async function loadData() {
+                try {
+                    const resp = await fetch('/api/rep-data');
+                    const d = await resp.json();
 
-                    document.getElementById('status').textContent =
-                        'Last updated: ' + (data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : '-');
+                    const jointNames = d.joint_names || [];
+                    const offset = d.offset || 0;
 
-                }} catch (err) {{
-                    document.getElementById('status').textContent = 'Error: ' + err.message;
-                }}
-            }}
+                    // Update rep counters
+                    document.getElementById('trainer-rep-count').textContent = d.trainer.rep_count;
+                    document.getElementById('user-rep-count').textContent = d.user.rep_count;
 
-            // WebSocket for live updates
-            function connectWS() {{
+                    // Rebuild charts if joints changed
+                    if (!arraysEqual(currentJoints, jointNames)) {
+                        currentJoints = jointNames;
+                        buildCharts(jointNames);
+                        // Allow DOM to settle before updating data
+                        await new Promise(r => setTimeout(r, 80));
+                    }
+
+                    if (jointNames.length === 0) return;
+
+                    // Update each chart
+                    ['trainer', 'user'].forEach(role => {
+                        const inf = d[role].inference;
+                        if (!inf) return;
+                        const labels = inf.labels_final;
+                        const foundReps = d[role].found_reps;
+
+                        // Map found_reps from absolute indices to window-relative indices
+                        const windowReps = foundReps.map(r => [r[0] - offset, r[1] - offset])
+                                                     .filter(r => r[1] >= 0 && r[0] < 480);
+
+                        jointNames.forEach((jname, jIdx) => {
+                            const key = jname + '|' + role;
+                            const u = charts[key];
+                            if (!u) return;
+
+                            const arr = inf.original_arrays[jIdx] || [];
+                            const frames = arr.map((_, i) => i);
+
+                            u._labelsRef.v = labels;
+                            u._repsRef.v = windowReps;
+
+                            u.setData([frames, arr]);
+                        });
+                    });
+                } catch (err) {
+                    console.error('Error loading rep data:', err);
+                }
+            }
+
+            // WebSocket real-time updates
+            function connectWS() {
                 const ws = new WebSocket('ws://' + location.host + '/ws/plot-updates');
-                ws.onopen = () => {{
-                    document.getElementById('status').textContent = 'Connected - waiting for updates...';
-                }};
-                ws.onmessage = (e) => {{
+                ws.onopen = () => console.log('[REP WS] Connected');
+                ws.onmessage = (e) => {
                     const msg = JSON.parse(e.data);
                     if (msg.type === 'data_updated') loadData();
-                }};
-                ws.onclose = () => {{
-                    document.getElementById('status').textContent = 'Disconnected, reconnecting...';
-                    setTimeout(connectWS, 2000);
-                }};
-            }}
+                };
+                ws.onclose = () => { console.log('[REP WS] Disconnected, reconnecting...'); setTimeout(connectWS, 2000); };
+                ws.onerror = () => {};
+            }
 
-            // Initial load
+            // Initial load + WS
             loadData();
             connectWS();
 
-            // Handle resize
-            window.addEventListener('resize', () => {{
-                Object.values(inputCharts).forEach(chart => {{
-                    const card = chart.root.parentNode;
-                    if (card) chart.setSize({{ width: card.clientWidth - 24, height: 150 }});
-                }});
-                if (outputChart) {{
-                    const container = document.getElementById('outputChart');
-                    outputChart.setSize({{ width: container.clientWidth - 32, height: 250 }});
-                }}
-            }});
-        }})();
+            // Resize handler
+            window.addEventListener('resize', () => {
+                Object.entries(charts).forEach(([key, u]) => {
+                    const wrap = u.root.parentNode;
+                    if (wrap) u.setSize({ width: wrap.clientWidth - 24, height: 200 });
+                });
+            });
+        })();
         </script>
     </body>
     </html>

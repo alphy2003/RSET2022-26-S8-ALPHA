@@ -63,7 +63,6 @@ function Workout() {
           };
           
           sendMessage(JSON.stringify(batch));
-          console.log(`📦 Sent batch of ${batch.frameCount} frames to backend`);
           
           // Clear the batch after sending
           frameBatchRef.current = [];
@@ -82,7 +81,6 @@ function Workout() {
             batchTimestamp: Date.now()
           };
           sendMessage(JSON.stringify(batch));
-          console.log(`📦 Final batch sent: ${batch.frameCount} frames`);
           frameBatchRef.current = [];
         }
       }
@@ -125,7 +123,8 @@ function Workout() {
       currentGesture,
       gestureConfidence,
       currentTimestampRef.current,
-      isPlaying
+      isPlaying,
+      isCameraOn
     );
     setCombinedData(snapshot);
     
@@ -147,7 +146,6 @@ function Workout() {
       
       if (isConnected) {
         sendMessage(JSON.stringify(batch));
-        console.log(`🛑 Data unchanged - sent ${batch.frameCount} frames, stopping accumulation`);
       }
       
       frameBatchRef.current = [];
@@ -157,14 +155,11 @@ function Workout() {
       if (isConnected && snapshot.t !== lastTimestampRef.current) {
         frameBatchRef.current.push(snapshot);
         lastTimestampRef.current = snapshot.t;
-        console.log(`📝 Buffered frame (${frameBatchRef.current.length} frames in batch)`);
       }
     }
     
     // Store current data for next comparison
     previousCombinedDataRef.current = snapshot;
-    
-    // Log combined data (you can also save to database, export, etc.)
     console.log('Combined Workout Data:', JSON.stringify(snapshot, null, 2));
   }, [trainerAngles, userAngles, currentGesture, gestureConfidence, isConnected, sendMessage, isPlaying, isCameraOn]);
 
@@ -172,14 +167,12 @@ function Workout() {
   const handleGestureControl = useCallback((gesture) => {
     // Check if video file exists using ref (to avoid stale closure)
     if (!videoFileRef.current) {
-      console.log('No video file uploaded yet');
       return;
     }
     
     // Get video element from ref
     const videoElement = videoUploadRef.current?.videoElement;
     if (!videoElement) {
-      console.log('Video element not ready');
       return;
     }
     

@@ -153,9 +153,162 @@ def score_all_metrics(results):
         'rom': score_rom(results['rom_difference'], results['trainer_rom']),
         'max_deviation': score_max_deviation(results['max_deviation'])
     }
-    
+
     scores['overall'] = calculate_overall_score(scores)
     return scores
+
+
+def generate_feedback_messages(results: dict) -> dict:
+    """
+    Generate human-readable feedback messages based on rep comparison metrics.
+
+    Args:
+        results: Dictionary from compare_reps() containing all metrics
+
+    Returns:
+        Dictionary with feedback messages for each metric category
+    """
+    # Get scores using existing functions
+    scores = score_all_metrics(results)
+
+    feedback = {}
+
+    # Speed feedback
+    length_ratio = results['length_ratio']
+    speed_score = scores['speed']
+    if length_ratio > 1.2:
+        feedback['speed'] = {
+            'category': speed_score['category'],
+            'message': f"You're moving {((length_ratio - 1) * 100):.0f}% slower than the trainer.",
+            'advice': "Try to increase your pace to match the trainer's tempo."
+        }
+    elif length_ratio < 0.8:
+        feedback['speed'] = {
+            'category': speed_score['category'],
+            'message': f"You're moving {((1 - length_ratio) * 100):.0f}% faster than the trainer.",
+            'advice': "Slow down to maintain control and proper form."
+        }
+    else:
+        feedback['speed'] = {
+            'category': speed_score['category'],
+            'message': "Your pace matches the trainer well.",
+            'advice': "Keep maintaining this tempo."
+        }
+
+    # Accuracy feedback (MAE)
+    mae = results['mae']
+    mae_score = scores['mae']
+    if mae > 25:
+        feedback['accuracy'] = {
+            'category': mae_score['category'],
+            'message': f"Average deviation of {mae:.1f}° from trainer's form.",
+            'advice': "Focus on matching the trainer's movement pattern more closely."
+        }
+    elif mae > 10:
+        feedback['accuracy'] = {
+            'category': mae_score['category'],
+            'message': f"Minor deviation of {mae:.1f}° from trainer's form.",
+            'advice': "Small adjustments needed to perfect your form."
+        }
+    else:
+        feedback['accuracy'] = {
+            'category': mae_score['category'],
+            'message': f"Excellent form accuracy ({mae:.1f}° average deviation).",
+            'advice': "Great job! Maintain this precision."
+        }
+
+    # ROM feedback
+    rom_diff = results['rom_difference']
+    rom_score = scores['rom']
+    user_rom = results['user_rom']
+    trainer_rom = results['trainer_rom']
+    if rom_diff < -15:
+        feedback['rom'] = {
+            'category': rom_score['category'],
+            'message': f"Your range of motion ({user_rom:.1f}°) is {abs(rom_diff):.1f}° less than trainer ({trainer_rom:.1f}°).",
+            'advice': "Extend your movement further to achieve full range of motion."
+        }
+    elif rom_diff > 15:
+        feedback['rom'] = {
+            'category': rom_score['category'],
+            'message': f"Your range of motion ({user_rom:.1f}°) exceeds trainer ({trainer_rom:.1f}°) by {rom_diff:.1f}°.",
+            'advice': "Control your movement to avoid overextension."
+        }
+    else:
+        feedback['rom'] = {
+            'category': rom_score['category'],
+            'message': f"Good range of motion ({user_rom:.1f}° vs trainer's {trainer_rom:.1f}°).",
+            'advice': "Maintain this range throughout your workout."
+        }
+
+    # Consistency feedback (RMSE)
+    rmse = results['rmse']
+    rmse_score = scores['rmse']
+    consistency_ratio = rmse / mae if mae > 0 else 1.0
+    if consistency_ratio > 1.5:
+        feedback['consistency'] = {
+            'category': rmse_score['category'],
+            'message': "Your movement has inconsistent spikes in deviation.",
+            'advice': "Focus on smooth, controlled movements throughout the rep."
+        }
+    else:
+        feedback['consistency'] = {
+            'category': rmse_score['category'],
+            'message': "Your movement pattern is consistent.",
+            'advice': "Good consistency - keep your movements smooth."
+        }
+
+    # Max deviation feedback
+    max_dev = results['max_deviation']
+    max_frame = results['max_deviation_frame']
+    max_dev_score = scores['max_deviation']
+    total_frames = int((results['user_length'] + results['trainer_length']) / 2)
+    position_pct = (max_frame / total_frames * 100) if total_frames > 0 else 0
+
+    if position_pct < 33:
+        position_desc = "at the start"
+    elif position_pct < 66:
+        position_desc = "in the middle"
+    else:
+        position_desc = "at the end"
+
+    if max_dev > 30:
+        feedback['max_deviation'] = {
+            'category': max_dev_score['category'],
+            'message': f"Largest deviation of {max_dev:.1f}° occurred {position_desc} of the rep.",
+            'advice': f"Pay extra attention to your form {position_desc} of each rep."
+        }
+    else:
+        feedback['max_deviation'] = {
+            'category': max_dev_score['category'],
+            'message': f"No major form breaks (max deviation: {max_dev:.1f}°).",
+            'advice': "Excellent control throughout the movement."
+        }
+
+    # Generate summary
+    overall = scores['overall']
+    weak_areas = overall.get('weak_areas', [])
+
+    if overall['category'] == 'Excellent':
+        summary = "Excellent rep! Your form closely matches the trainer."
+    elif overall['category'] == 'Fair':
+        if weak_areas:
+            weak_names = [w['metric'] for w in weak_areas[:2]]
+            summary = f"Good effort! Focus on improving: {', '.join(weak_names)}."
+        else:
+            summary = "Good rep with room for improvement."
+    else:
+        if weak_areas:
+            weak_names = [w['metric'] for w in weak_areas[:2]]
+            summary = f"Needs work. Priority areas: {', '.join(weak_names)}."
+        else:
+            summary = "This rep needs significant improvement."
+
+    feedback['summary'] = summary
+    feedback['overall_score'] = overall['overall_score']
+    feedback['overall_category'] = overall['category']
+
+    return feedback
 
 
 def interpolate_to_length(arr, target_length):
@@ -220,11 +373,14 @@ def compare_reps(user_array, trainer_array):
 def analyze_rep(user_array, trainer_array):
     results = compare_reps(user_array, trainer_array)
     scores = score_all_metrics(results)
-    return scores
+    feedback = generate_feedback_messages(results)
+    return scores, feedback
 
 
 if __name__ == "__main__":
     trainer = np.array([30, 45, 60, 80, 95, 110, 120, 130, 135, 130, 120, 110, 95, 80, 60, 45, 30])
     user = np.array([50, 70, 85, 75, 90, 70, 85, 95, 90])    
-    result = analyze_rep(user, trainer)
+    result, feedback = analyze_rep(user, trainer)
     print(result)
+    print("\n\n")
+    print(feedback)

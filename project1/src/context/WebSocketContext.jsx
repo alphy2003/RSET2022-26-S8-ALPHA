@@ -17,8 +17,6 @@ export const WebSocketProvider = ({ children }) => {
     };
 
     ws.current.onmessage = (event) => {
-      console.log('Message received:', event.data);
-      
       // Try to parse as JSON to check for feedback messages
       try {
         const parsed = JSON.parse(event.data);

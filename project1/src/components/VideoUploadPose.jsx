@@ -142,7 +142,7 @@ const VideoUploadPose = forwardRef(({ videoFile, onVideoFileChange, onPlayStateC
         });
 
         pose.setOptions({
-          modelComplexity: 2,
+          modelComplexity: 1,
           smoothLandmarks: true,
           enableSegmentation: false,
           minDetectionConfidence: 0.5,
