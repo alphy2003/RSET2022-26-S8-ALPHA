@@ -98,6 +98,15 @@
       <br />
       <sub>Backend Developer</sub>
     </td>
+    <td align="center">
+      <a href="https://github.com/Aaron-hub-dev-maker">
+        <img src="https://github.com/Aaron-hub-dev-maker.png" width="100" style="border-radius:50%" />
+        <br />
+        <b>Actinker</b>
+      </a>
+      <br />
+      <sub>Aptitude Developer</sub>
+    </td>
   </tr>
 </table>
 
